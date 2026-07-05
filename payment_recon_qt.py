@@ -90,6 +90,36 @@ def normalize_header(value) -> str:
     return str(value or "").strip().replace("\n", "").replace("\r", "")
 
 
+HEADER_ALIASES = {
+    "店铺": ["店铺"],
+    "月份": ["动账时间1", "动帐时间1", "月份", "账期", "帐期"],
+    "动账时间": ["动账时间", "动帐时间", "交易时间", "发生时间"],
+    "动账流水号": ["动账流水号", "动帐流水号", "流水号", "资金流水号"],
+    "动账方向": ["动账方向", "动帐方向", "收支方向"],
+    "动账账户": ["动账账户", "动帐账户", "账户"],
+    "动账金额": ["动账金额", "动帐金额", "金额"],
+    "动账摘要": ["动账摘要", "动帐摘要", "动账场景", "动帐场景", "计费类型", "摘要"],
+    "业务类型": ["业务类型", "订单类型", "计费类型"],
+    "主订单编号": ["主订单编号", "订单号"],
+    "子订单编号": ["子订单编号", "子订单号"],
+    "售后单号": ["售后单号", "售后编号"],
+    "下单时间": ["下单时间"],
+    "商品信息": ["商品信息", "商品名称"],
+    "商品编码": ["商品编码", "商品ID"],
+    "售卖类型": ["售卖类型", "订单类型"],
+}
+
+AMOUNT_ALIASES = {
+    "订单实付应结": ["订单实付应结"],
+    "平台补贴": ["平台补贴", "实际平台补贴_运费", "实际平台补贴", "其他平台补贴", "政府补贴平台垫资"],
+    "商家补贴": ["商家补贴", "实际达人补贴", "实际抖音支付补贴", "实际抖音月付营销补贴", "银行补贴", "以旧换新抵扣"],
+    "结算运费": ["结算运费", "运费实付"],
+    "订单退款": ["订单退款"],
+    "佣金": ["佣金", "服务商佣金", "渠道分成", "招商服务费", "站外推广费", "其他分成"],
+    "技术服务费": ["技术服务费", "平台服务费"],
+}
+
+
 def difference_reason(row) -> str:
     if row["account_ending"] is None:
         return "未录入店铺期末余额"
@@ -350,25 +380,48 @@ class Repository:
                     return None
                 return row[pos]
 
-            required = ["动账时间1", "动账时间", "动账流水号", "动账方向", "动账金额", "动账摘要"]
-            if not selected_store:
-                required.append("店铺")
-            missing = [name for name in required if name not in idx]
-            if missing:
-                raise ValueError(f"工作表 {ws.title} 缺少列：{', '.join(missing)}")
+            def aliased(row, name):
+                for candidate in HEADER_ALIASES.get(name, [name]):
+                    value = cell(row, candidate)
+                    if value not in (None, ""):
+                        return value
+                return None
+
+            def amount_sum(row, name):
+                total = Decimal("0.00")
+                found = False
+                for candidate in AMOUNT_ALIASES.get(name, [name]):
+                    if candidate in idx:
+                        total += money(cell(row, candidate))
+                        found = True
+                return total if found else money(cell(row, name))
+
+            has_store = selected_store or any(name in idx for name in HEADER_ALIASES["店铺"])
+            has_month_or_time = any(name in idx for name in HEADER_ALIASES["月份"] + HEADER_ALIASES["动账时间"])
+            if not has_store or not has_month_or_time:
+                missing = []
+                if not has_store:
+                    missing.append("店铺")
+                if not has_month_or_time:
+                    missing.append("月份或动账时间")
+                raise ValueError(f"工作表 {ws.title} 无法自动识别关键列：{', '.join(missing)}")
 
             for row in rows:
-                store = selected_store or str(cell(row, "店铺") or "").strip()
+                store = selected_store or str(aliased(row, "店铺") or "").strip()
                 if store:
                     self.ensure_store_config(store)
                     self.merge_store_raw_columns(store, headers)
-                month_label = str(cell(row, "动账时间1") or "").strip()
-                flow_id = str(cell(row, "动账流水号") or "").strip()
-                if not store or not month_label:
+                transaction_time = aliased(row, "动账时间")
+                month_label = str(aliased(row, "月份") or "").strip()
+                month_sort = parse_month_sort(month_label, transaction_time)
+                if not month_label:
+                    month_label = month_sort
+                flow_id = str(aliased(row, "动账流水号") or "").strip()
+                if not flow_id:
+                    flow_id = f"{Path(path).name}:{ws.title}:{imported + skipped + 2}"
+                if not store or not month_sort:
                     skipped += 1
                     continue
-                transaction_time = cell(row, "动账时间")
-                month_sort = parse_month_sort(month_label, transaction_time)
                 raw_payload = {
                     headers[i]: json_default(row[i]) if i < len(row) else ""
                     for i in range(len(headers))
@@ -377,16 +430,16 @@ class Repository:
                 values = (
                     Path(path).name, now, store, month_label, month_sort,
                     str(transaction_time or ""), flow_id,
-                    str(cell(row, "动账方向") or ""), str(cell(row, "动账账户") or ""),
-                    db_float(cell(row, "动账金额")), str(cell(row, "动账摘要") or ""),
-                    str(cell(row, "业务类型") or ""), str(cell(row, "主订单编号") or ""),
-                    str(cell(row, "子订单编号") or ""), str(cell(row, "售后单号") or ""),
-                    str(cell(row, "下单时间") or ""), str(cell(row, "商品信息") or ""),
-                    str(cell(row, "商品编码") or ""), str(cell(row, "售卖类型") or ""),
-                    db_float(cell(row, "订单实付应结")), db_float(cell(row, "平台补贴")),
-                    db_float(cell(row, "商家补贴")), db_float(cell(row, "结算运费")),
-                    db_float(cell(row, "订单退款")), db_float(cell(row, "佣金")),
-                    db_float(cell(row, "技术服务费")),
+                    str(aliased(row, "动账方向") or ""), str(aliased(row, "动账账户") or ""),
+                    db_float(aliased(row, "动账金额")), str(aliased(row, "动账摘要") or ""),
+                    str(aliased(row, "业务类型") or ""), str(aliased(row, "主订单编号") or ""),
+                    str(aliased(row, "子订单编号") or ""), str(aliased(row, "售后单号") or ""),
+                    str(aliased(row, "下单时间") or ""), str(aliased(row, "商品信息") or ""),
+                    str(aliased(row, "商品编码") or ""), str(aliased(row, "售卖类型") or ""),
+                    db_float(amount_sum(row, "订单实付应结")), db_float(amount_sum(row, "平台补贴")),
+                    db_float(amount_sum(row, "商家补贴")), db_float(amount_sum(row, "结算运费")),
+                    db_float(amount_sum(row, "订单退款")), db_float(amount_sum(row, "佣金")),
+                    db_float(amount_sum(row, "技术服务费")),
                     json.dumps(raw_payload, ensure_ascii=False, default=json_default),
                 )
                 try:
