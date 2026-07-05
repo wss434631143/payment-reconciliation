@@ -1,4 +1,4 @@
 interface:
-  display_name: "Windows Qt App Release"
-  short_description: "Build, polish, package, and publish Windows Qt apps."
-  default_prompt: "Use $windows-qt-app-release to build, optimize, package, and publish a Windows Qt desktop app."
+  display_name: "Windows Qt 应用开发发布"
+  short_description: "开发、优化、打包并发布 Windows Qt 桌面程序。"
+  default_prompt: "使用 $windows-qt-app-release 开发、优化、打包并发布一个 Windows Qt 桌面程序。"

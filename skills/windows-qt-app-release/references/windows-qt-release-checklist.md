@@ -1,65 +1,64 @@
-# Windows Qt App Release Checklist
+# Windows Qt 应用开发发布检查清单
 
-## 1. Requirements And Design
+## 1. 需求与设计
 
-- Capture the user’s domain workflow in a repository document.
-- List actors, inputs, outputs, calculations, data storage, import/export formats, and release expectations.
-- For finance tools, document every money formula and the meaning of manually entered balances.
-- Record data isolation rules, such as one SQLite database per store or tenant.
+- 把用户的业务流程写成仓库文档，不要只留在聊天记录里。
+- 明确角色、输入文件、输出文件、金额公式、数据存储、导入导出格式和发布方式。
+- 财务类工具必须写清每个金额字段的含义，以及用户手工录入余额的含义。
+- 写清数据隔离规则，例如每个店铺、租户或主体是否使用独立 SQLite 数据库。
 
-## 2. Qt Application Structure
+## 2. Qt 应用结构
 
-- Keep UI code and persistence/business logic separate when possible.
-- Use `QSplitter` for user-adjustable table/control regions.
-- Use `QTableWidget` or model/view tables with pagination for large datasets.
-- Use `QComboBox` for configured values, report types, months, stores, and filter values.
-- Use business-specific Chinese button labels when the app is Chinese-facing.
+- 界面代码和业务/数据库代码尽量分离。
+- 需要用户调节表格宽度或高度时使用 `QSplitter`。
+- 大表使用分页表格，不默认加载全部明细。
+- 固定选项使用 `QComboBox`，例如店铺、报表类型、年月、筛选字段和筛选值。
+- 中文业务程序的按钮文案必须贴合场景，不使用默认 `OK/Cancel`。
 
-## 3. Large Data UX
+## 3. 大数据交互
 
-- Import: show progress text with processed rows and final imported/skipped counts.
-- Query: avoid loading detail rows until the user selects a summary row or clicks query.
-- Filter: collect multiple filter conditions first, then execute once.
-- Export: stream XLSX writes and read database rows in batches.
-- Status area: keep messages short, one-line when possible, and use tooltip for full paths.
+- 导入时显示已处理行数、最终新增行数和跳过行数。
+- 查询时先加载汇总，明细只加载当前页。
+- 筛选时先收集多个条件，用户点击“开始筛选”后再查询。
+- 导出 XLSX 时使用流式写入，并按批读取数据库。
+- 状态栏保持短句，长路径用 tooltip 或弹窗展示。
 
-## 4. SQLite Practices
+## 4. SQLite 实践
 
-- Create stable indexes for store, report type, month, transaction time, flow ID, and common filter columns.
-- Store raw row payloads when different stores have different original columns.
-- Separate master configuration from tenant/store data when data volume or schema differences matter.
-- Provide backup/restore for all stores and selected stores.
+- 给店铺、报表类型、年月、动账时间、流水号和常用筛选字段建立索引。
+- 不同店铺原始字段不同的场景，保留 raw payload，避免强行统一所有字段。
+- 主库只放全局配置和店铺清单，店铺库放流水、余额、调整和字段配置。
+- 提供全部店铺和部分店铺的备份还原。
 
-## 5. UI Polish
+## 5. UI 打磨
 
-- Use consistent spacing and button placement.
-- Keep row actions near pagination when both operate on the same table.
-- Let long filter summaries wrap or display in multiple lines.
-- Avoid modal progress windows for long imports if they flash or block awkwardly; prefer a stable status/progress area.
-- Use real icons and an application `.ico`.
+- 顶部说明文字要服务当前操作，不放无意义宣传小字。
+- 状态栏放在程序底部，作为进度和当前状态提示。
+- 分页按钮和编辑/删除当前行按钮要靠近，因为它们服务同一个明细表。
+- 筛选条件过多时换行显示，不要堆在一行导致后面看不见。
+- 长时间任务不要使用闪烁的进度弹窗，优先使用稳定状态栏。
+- 程序和安装包都要使用真实 `.ico` 图标。
 
-## 6. Packaging
+## 6. 打包
 
-- Confirm dependencies are installed in a reproducible runtime.
-- Build with PyInstaller `--windowed --onefile`.
-- Include hidden imports for PySide6 modules when needed.
-- Include an app icon with `--icon`.
-- If overwrite fails, check whether the old exe is running or build with a versioned name.
-- Create a release zip containing the exe and essential docs.
+- 使用可复现的 Python 和依赖路径。
+- 主程序打包参数至少包含 `--windowed --onefile --icon`。
+- PySide6 程序常需要显式加 `PySide6.QtCore`、`PySide6.QtGui`、`PySide6.QtWidgets`。
+- 若用户需要安装体验，额外生成 setup 安装包，支持安装路径和快捷方式选项。
+- 发布 zip 只放最终资产，不放数据库和构建缓存。
 
-## 7. GitHub Publishing
+## 7. GitHub 发布
 
-- Update README, CHANGELOG, release notes, and requirements/design docs.
-- Keep `.gitignore` excluding `data/`, `build/`, `dist/`, caches, logs, and SQLite files.
-- Commit source and docs.
-- Create or update a GitHub Release.
-- Upload both a zip and an ASCII-named exe.
-- Read back the Release asset list to confirm download URLs.
+- 更新 README、CHANGELOG、Release Notes、需求设计文档。
+- `.gitignore` 排除 `data/`、`build/`、`dist/`、缓存、日志和 SQLite 文件。
+- 提交源码和文档。
+- 创建或更新 GitHub Release。
+- 上传 setup、单文件 exe 和 zip。
+- 读回 Release 资产列表，确认下载链接和大小。
 
-## 8. README Demo GIF
+## 8. README 动图
 
-- Generate the demo from the actual app window.
-- On Windows, use the native Qt platform for screenshots so Chinese fonts render.
-- Use offscreen only for startup smoke tests.
-- Keep the GIF lightweight and focused on the main workflow.
-- If no real user data should appear, use a seeded sample database before recording.
+- 动图必须来自实际程序窗口。
+- Windows 中文界面截图要使用原生窗口模式，不要用 offscreen 生成最终动图。
+- 如果不希望真实数据出现在动图中，先准备脱敏样例数据库。
+- 动图只展示主流程，不要过长。
