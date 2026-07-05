@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import csv
+import json
 import os
 import sqlite3
 import sys
@@ -41,6 +42,15 @@ ADJUSTABLE_COLUMNS = [
     "备查（不影响汇总）", "订单实付应结", "平台补贴", "商家补贴", "结算运费", "订单退款",
     "已结算佣金", "技术服务费", "提现金额", "期初金额",
 ]
+
+SUMMARY_EXTRA_COLUMNS = ["店铺期末余额", "差异", "差异原因", "调整说明"]
+
+DEFAULT_FORMULA_NOTE = (
+    "收入净额合计=订单实付应结+平台补贴+商家补贴+结算运费+订单退款；"
+    "支出金额=已结算佣金+技术服务费；"
+    "结算金额=收入净额合计+支出金额；"
+    "结算期末余额=期初金额+收入净额合计+支出金额+提现金额。"
+)
 
 
 def money(value) -> Decimal:
@@ -97,6 +107,62 @@ def parse_month_sort(label, transaction_time=None) -> str:
     return label
 
 
+def normalize_month_token(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 6:
+        return f"{digits[:4]}-{digits[4:6]}"
+    if len(text) >= 7 and text[4] in "-/":
+        return text[:7].replace("/", "-")
+    return text
+
+
+def parse_month_filter(value):
+    text = str(value or "").strip()
+    if not text:
+        return []
+    text = text.replace("，", ",").replace("、", ",").replace("至", "-").replace("到", "-")
+    if "," in text:
+        return [m for m in (normalize_month_token(part) for part in text.split(",")) if m]
+    if "-" in text:
+        compact = text.replace(" ", "")
+        digits = "".join(ch for ch in compact if ch.isdigit())
+        if len(digits) == 12:
+            start = normalize_month_token(digits[:6])
+            end = normalize_month_token(digits[6:])
+            return month_range(start, end)
+    month = normalize_month_token(text)
+    return [month] if month else []
+
+
+def month_range(start, end):
+    start = normalize_month_token(start)
+    end = normalize_month_token(end)
+    if not start or not end:
+        return []
+    sy, sm = [int(x) for x in start.split("-")]
+    ey, em = [int(x) for x in end.split("-")]
+    months = []
+    y, m = sy, sm
+    while (y, m) <= (ey, em):
+        months.append(f"{y:04d}-{m:02d}")
+        m += 1
+        if m == 13:
+            y += 1
+            m = 1
+    return months
+
+
+def json_default(value):
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, Decimal):
+        return str(value)
+    return str(value)
+
+
 @dataclass
 class ImportResult:
     imported: int
@@ -151,7 +217,17 @@ class Repository:
                 refund REAL DEFAULT 0,
                 commission REAL DEFAULT 0,
                 tech_fee REAL DEFAULT 0,
+                raw_payload TEXT,
                 UNIQUE(store, month_sort, flow_id, sub_order, summary, amount)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS store_configs (
+                store TEXT PRIMARY KEY,
+                raw_columns TEXT,
+                summary_columns TEXT,
+                formula_note TEXT,
+                updated_at TEXT NOT NULL
             )
         """)
         cur.execute("""
@@ -183,12 +259,24 @@ class Repository:
         adj_cols = {row["name"] for row in cur.execute("PRAGMA table_info(adjustments)").fetchall()}
         if "target_column" not in adj_cols:
             cur.execute("ALTER TABLE adjustments ADD COLUMN target_column TEXT DEFAULT '备查（不影响汇总）'")
+        tx_cols = {row["name"] for row in cur.execute("PRAGMA table_info(transactions)").fetchall()}
+        if "raw_payload" not in tx_cols:
+            cur.execute("ALTER TABLE transactions ADD COLUMN raw_payload TEXT")
         cur.execute("""
             INSERT OR IGNORE INTO stores (name, note, active, created_at)
             SELECT DISTINCT store, '', 1, ?
             FROM transactions
             WHERE store IS NOT NULL AND TRIM(store) <> ''
         """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"),))
+        cur.execute("""
+            INSERT OR IGNORE INTO store_configs (store, raw_columns, summary_columns, formula_note, updated_at)
+            SELECT name, ?, ?, ?, ? FROM stores
+        """, (
+            json.dumps(RAW_COLUMNS, ensure_ascii=False),
+            json.dumps(SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS, ensure_ascii=False),
+            DEFAULT_FORMULA_NOTE,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ))
         self.conn.commit()
 
     def import_excel(self, path: str, selected_store: str = "") -> ImportResult:
@@ -208,6 +296,8 @@ class Repository:
             except StopIteration:
                 continue
             idx = {name: i for i, name in enumerate(headers)}
+            if selected_store:
+                self.merge_store_raw_columns(selected_store, headers)
 
             def cell(row, name):
                 pos = idx.get(name)
@@ -224,6 +314,9 @@ class Repository:
 
             for row in rows:
                 store = selected_store or str(cell(row, "店铺") or "").strip()
+                if store:
+                    self.ensure_store_config(store)
+                    self.merge_store_raw_columns(store, headers)
                 month_label = str(cell(row, "动账时间1") or "").strip()
                 flow_id = str(cell(row, "动账流水号") or "").strip()
                 if not store or not month_label:
@@ -231,6 +324,11 @@ class Repository:
                     continue
                 transaction_time = cell(row, "动账时间")
                 month_sort = parse_month_sort(month_label, transaction_time)
+                raw_payload = {
+                    headers[i]: json_default(row[i]) if i < len(row) else ""
+                    for i in range(len(headers))
+                    if headers[i]
+                }
                 values = (
                     Path(path).name, now, store, month_label, month_sort,
                     str(transaction_time or ""), flow_id,
@@ -244,6 +342,7 @@ class Repository:
                     db_float(cell(row, "商家补贴")), db_float(cell(row, "结算运费")),
                     db_float(cell(row, "订单退款")), db_float(cell(row, "佣金")),
                     db_float(cell(row, "技术服务费")),
+                    json.dumps(raw_payload, ensure_ascii=False, default=json_default),
                 )
                 try:
                     cur.execute("""
@@ -253,8 +352,8 @@ class Repository:
                             summary, biz_type, main_order, sub_order, after_sale, order_time,
                             product_info, product_code, sale_type, paid_settlement,
                             platform_subsidy, merchant_subsidy, freight, refund,
-                            commission, tech_fee
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            commission, tech_fee, raw_payload
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, values)
                     imported += 1
                 except sqlite3.IntegrityError:
@@ -279,6 +378,7 @@ class Repository:
             VALUES (?, ?, 1, ?)
             ON CONFLICT(name) DO UPDATE SET note=excluded.note, active=1
         """, (name, note, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        self.ensure_store_config(name)
         self.conn.commit()
 
     def delete_store(self, name):
@@ -296,9 +396,76 @@ class Repository:
         """).fetchall()
         return [r[0] for r in rows if r[0]]
 
+    def ensure_store_config(self, store):
+        if not store:
+            return
+        self.conn.execute("""
+            INSERT OR IGNORE INTO store_configs (store, raw_columns, summary_columns, formula_note, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            store,
+            json.dumps(RAW_COLUMNS, ensure_ascii=False),
+            json.dumps(SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS, ensure_ascii=False),
+            DEFAULT_FORMULA_NOTE,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ))
+
+    def store_config(self, store):
+        self.ensure_store_config(store)
+        row = self.conn.execute("SELECT * FROM store_configs WHERE store=?", (store,)).fetchone()
+        if not row:
+            return {
+                "store": store,
+                "raw_columns": RAW_COLUMNS,
+                "summary_columns": SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS,
+                "formula_note": DEFAULT_FORMULA_NOTE,
+            }
+        return {
+            "store": store,
+            "raw_columns": self._loads_columns(row["raw_columns"], RAW_COLUMNS),
+            "summary_columns": self._loads_columns(row["summary_columns"], SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS),
+            "formula_note": row["formula_note"] or DEFAULT_FORMULA_NOTE,
+        }
+
+    def _loads_columns(self, text, fallback):
+        try:
+            values = json.loads(text or "[]")
+            return [str(v).strip() for v in values if str(v).strip()] or list(fallback)
+        except Exception:
+            return list(fallback)
+
+    def save_store_config(self, store, raw_columns, summary_columns, formula_note):
+        self.ensure_store_config(store)
+        self.conn.execute("""
+            UPDATE store_configs
+            SET raw_columns=?, summary_columns=?, formula_note=?, updated_at=?
+            WHERE store=?
+        """, (
+            json.dumps(raw_columns, ensure_ascii=False),
+            json.dumps(summary_columns, ensure_ascii=False),
+            formula_note,
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            store,
+        ))
+        self.conn.commit()
+
+    def merge_store_raw_columns(self, store, headers):
+        if not store:
+            return
+        config = self.store_config(store)
+        columns = list(config["raw_columns"])
+        changed = False
+        for header in headers:
+            header = str(header or "").strip()
+            if header and header not in columns:
+                columns.append(header)
+                changed = True
+        if changed:
+            self.save_store_config(store, columns, config["summary_columns"], config["formula_note"])
+
     def months(self):
         rows = self.conn.execute("SELECT DISTINCT month_sort, month_label FROM transactions UNION SELECT DISTINCT month_sort, month_label FROM balances ORDER BY month_sort").fetchall()
-        return [f"{r['month_sort']} {r['month_label']}" for r in rows]
+        return [{"month_sort": r["month_sort"], "month_label": r["month_label"]} for r in rows]
 
     def upsert_balance(self, store, month_label, month_sort, opening, account_ending, note):
         self.conn.execute("""
@@ -351,17 +518,31 @@ class Repository:
         self.conn.execute("DELETE FROM adjustments WHERE id=?", (adj_id,))
         self.conn.commit()
 
-    def monthly_summaries(self, store_filter="", month_filter=""):
+    def monthly_summaries(self, store_filter="", month_filter="", aggregate=True):
+        months = parse_month_filter(month_filter)
+        tx_rows = self._monthly_base_rows(store_filter, months)
+        month_rows = [self._build_month_summary(row) for row in tx_rows]
+        month_rows.extend(self._balance_only_rows(store_filter, months))
+        month_rows = sorted(month_rows, key=lambda x: (x["store"], x["month_sort"]))
+        if not aggregate or len(months) <= 1:
+            return month_rows
+        return self._aggregate_rows(month_rows, months)
+
+    def _month_where(self, where, params, months):
+        if months:
+            where.append("month_sort IN (%s)" % ",".join("?" for _ in months))
+            params.extend(months)
+
+    def _monthly_base_rows(self, store_filter="", months=None):
+        months = months or []
         params = []
         where = []
         if store_filter:
             where.append("store LIKE ?")
             params.append(f"%{store_filter}%")
-        if month_filter:
-            where.append("(month_sort LIKE ? OR month_label LIKE ?)")
-            params.extend([f"%{month_filter}%", f"%{month_filter}%"])
+        self._month_where(where, params, months)
         where_sql = "WHERE " + " AND ".join(where) if where else ""
-        tx_rows = self.conn.execute(f"""
+        return self.conn.execute(f"""
             SELECT store, month_label, month_sort,
                    SUM(CASE WHEN summary='账户余额提现' THEN amount ELSE 0 END) AS withdraw_amount,
                    SUM(paid_settlement) AS paid_settlement,
@@ -379,57 +560,51 @@ class Repository:
             GROUP BY store, month_sort
         """, params).fetchall()
 
-        result = []
-        for row in tx_rows:
-            balance = self.balance_for(row["store"], row["month_sort"])
-            adjustments_by_target = self.adjustment_totals_by_target(row["store"], row["month_sort"])
-            adjustments = self.adjustment_total(row["store"], row["month_sort"])
-            paid_settlement = money(row["paid_settlement"]) + adjustments_by_target.get("订单实付应结", Decimal("0.00"))
-            platform_subsidy = money(row["platform_subsidy"]) + adjustments_by_target.get("平台补贴", Decimal("0.00"))
-            merchant_subsidy = money(row["merchant_subsidy"]) + adjustments_by_target.get("商家补贴", Decimal("0.00"))
-            freight = money(row["freight"]) + adjustments_by_target.get("结算运费", Decimal("0.00"))
-            refund = money(row["refund"]) + adjustments_by_target.get("订单退款", Decimal("0.00"))
-            commission = money(row["commission"]) + adjustments_by_target.get("已结算佣金", Decimal("0.00"))
-            tech_fee = money(row["tech_fee"]) + adjustments_by_target.get("技术服务费", Decimal("0.00"))
-            withdraw_amount = money(row["withdraw_amount"]) + adjustments_by_target.get("提现金额", Decimal("0.00"))
-            opening = money(balance["opening_balance"] if balance else 0) + adjustments_by_target.get("期初金额", Decimal("0.00"))
-            income_total = paid_settlement + platform_subsidy + merchant_subsidy + freight + refund
-            expense_amount = commission + tech_fee
-            settlement_amount = income_total + expense_amount
-            ending = opening + income_total + expense_amount + withdraw_amount
-            account_ending = None if not balance or balance["account_ending_balance"] is None else money(balance["account_ending_balance"])
-            diff = None if account_ending is None else ending - account_ending
-            result.append({
-                "store": row["store"], "month_label": row["month_label"], "month_sort": row["month_sort"],
-                "paid_settlement": paid_settlement,
-                "platform_subsidy": platform_subsidy,
-                "merchant_subsidy": merchant_subsidy,
-                "freight": freight,
-                "refund": refund,
-                "income_total": income_total,
-                "commission": commission,
-                "tech_fee": tech_fee,
-                "expense_amount": expense_amount,
-                "settlement_amount": settlement_amount,
-                "withdraw_amount": withdraw_amount,
-                "opening_balance": opening,
-                "adjustments": adjustments,
-                "adjustments_by_target": adjustments_by_target,
-                "ending_balance": ending,
-                "account_ending": account_ending,
-                "difference": diff,
-            })
+    def _build_month_summary(self, row):
+        balance = self.balance_for(row["store"], row["month_sort"])
+        adjustments_by_target = self.adjustment_totals_by_target(row["store"], row["month_sort"])
+        paid_settlement = money(row["paid_settlement"]) + adjustments_by_target.get("订单实付应结", Decimal("0.00"))
+        platform_subsidy = money(row["platform_subsidy"]) + adjustments_by_target.get("平台补贴", Decimal("0.00"))
+        merchant_subsidy = money(row["merchant_subsidy"]) + adjustments_by_target.get("商家补贴", Decimal("0.00"))
+        freight = money(row["freight"]) + adjustments_by_target.get("结算运费", Decimal("0.00"))
+        refund = money(row["refund"]) + adjustments_by_target.get("订单退款", Decimal("0.00"))
+        commission = money(row["commission"]) + adjustments_by_target.get("已结算佣金", Decimal("0.00"))
+        tech_fee = money(row["tech_fee"]) + adjustments_by_target.get("技术服务费", Decimal("0.00"))
+        withdraw_amount = money(row["withdraw_amount"]) + adjustments_by_target.get("提现金额", Decimal("0.00"))
+        opening = money(balance["opening_balance"] if balance else 0) + adjustments_by_target.get("期初金额", Decimal("0.00"))
+        income_total = paid_settlement + platform_subsidy + merchant_subsidy + freight + refund
+        expense_amount = commission + tech_fee
+        settlement_amount = income_total + expense_amount
+        ending = opening + income_total + expense_amount + withdraw_amount
+        account_ending = None if not balance or balance["account_ending_balance"] is None else money(balance["account_ending_balance"])
+        diff = None if account_ending is None else ending - account_ending
+        return {
+            "store": row["store"], "month_label": row["month_label"], "month_sort": row["month_sort"],
+            "month_sorts": [row["month_sort"]], "is_aggregate": False,
+            "paid_settlement": paid_settlement, "platform_subsidy": platform_subsidy,
+            "merchant_subsidy": merchant_subsidy, "freight": freight, "refund": refund,
+            "income_total": income_total, "commission": commission, "tech_fee": tech_fee,
+            "expense_amount": expense_amount, "settlement_amount": settlement_amount,
+            "withdraw_amount": withdraw_amount, "opening_balance": opening,
+            "adjustments": self.adjustment_total(row["store"], row["month_sort"]),
+            "adjustments_by_target": adjustments_by_target,
+            "adjustment_notes": self.adjustment_notes(row["store"], [row["month_sort"]]),
+            "ending_balance": ending, "account_ending": account_ending, "difference": diff,
+        }
 
-        balance_only = self.conn.execute("""
+    def _balance_only_rows(self, store_filter="", months=None):
+        months = months or []
+        result = []
+        rows = self.conn.execute("""
             SELECT b.* FROM balances b
             LEFT JOIN transactions t ON t.store=b.store AND t.month_sort=b.month_sort
             WHERE t.id IS NULL
             ORDER BY b.store, b.month_sort
         """).fetchall()
-        for row in balance_only:
+        for row in rows:
             if store_filter and store_filter not in row["store"]:
                 continue
-            if month_filter and month_filter not in row["month_sort"] and month_filter not in row["month_label"]:
+            if months and row["month_sort"] not in months:
                 continue
             opening = money(row["opening_balance"])
             adjustments_by_target = self.adjustment_totals_by_target(row["store"], row["month_sort"])
@@ -449,17 +624,55 @@ class Repository:
             account_ending = None if row["account_ending_balance"] is None else money(row["account_ending_balance"])
             result.append({
                 "store": row["store"], "month_label": row["month_label"], "month_sort": row["month_sort"],
+                "month_sorts": [row["month_sort"]], "is_aggregate": False,
                 "paid_settlement": paid_settlement, "platform_subsidy": platform_subsidy, "merchant_subsidy": merchant_subsidy,
                 "freight": freight, "refund": refund, "income_total": income_total,
                 "commission": commission, "tech_fee": tech_fee, "expense_amount": expense_amount,
                 "settlement_amount": settlement_amount, "withdraw_amount": withdraw_amount,
                 "opening_balance": opening, "adjustments": self.adjustment_total(row["store"], row["month_sort"]),
                 "adjustments_by_target": adjustments_by_target,
+                "adjustment_notes": self.adjustment_notes(row["store"], [row["month_sort"]]),
                 "ending_balance": ending, "account_ending": account_ending,
                 "difference": None if account_ending is None else ending - account_ending,
             })
+        return result
 
-        return sorted(result, key=lambda x: (x["store"], x["month_sort"]))
+    def _aggregate_rows(self, rows, months):
+        result = []
+        by_store = {}
+        for row in rows:
+            by_store.setdefault(row["store"], []).append(row)
+        numeric_sum_fields = [
+            "paid_settlement", "platform_subsidy", "merchant_subsidy", "freight", "refund",
+            "income_total", "commission", "tech_fee", "expense_amount", "settlement_amount",
+            "withdraw_amount", "adjustments",
+        ]
+        for store, store_rows in by_store.items():
+            store_rows = sorted(store_rows, key=lambda r: r["month_sort"])
+            first_month = store_rows[0]["month_sort"]
+            last_month = store_rows[-1]["month_sort"]
+            first_balance = self.balance_for(store, first_month)
+            last_balance = self.balance_for(store, last_month)
+            aggregate = {
+                "store": store,
+                "month_label": f"{months[0]}至{months[-1]}",
+                "month_sort": f"{months[0]}~{months[-1]}",
+                "month_sorts": [r["month_sort"] for r in store_rows],
+                "is_aggregate": True,
+                "opening_balance": money(first_balance["opening_balance"] if first_balance else store_rows[0]["opening_balance"]),
+                "account_ending": None if not last_balance or last_balance["account_ending_balance"] is None else money(last_balance["account_ending_balance"]),
+                "adjustment_notes": self.adjustment_notes(store, [r["month_sort"] for r in store_rows]),
+            }
+            for field in numeric_sum_fields:
+                aggregate[field] = sum((money(r[field]) for r in store_rows), Decimal("0.00"))
+            aggregate["ending_balance"] = (
+                aggregate["opening_balance"] + aggregate["income_total"] +
+                aggregate["expense_amount"] + aggregate["withdraw_amount"]
+            )
+            aggregate["difference"] = None if aggregate["account_ending"] is None else aggregate["ending_balance"] - aggregate["account_ending"]
+            result.append(aggregate)
+            result.extend(store_rows)
+        return result
 
     def balance_for(self, store, month_sort):
         return self.conn.execute("SELECT * FROM balances WHERE store=? AND month_sort=?", (store, month_sort)).fetchone()
@@ -477,13 +690,60 @@ class Repository:
         """, (store, month_sort)).fetchall()
         return {row["target_column"]: money(row["total"]) for row in rows}
 
-    def details(self, store, month_sort):
-        return self.conn.execute("""
-            SELECT * FROM transactions WHERE store=? AND month_sort=?
-            ORDER BY transaction_time DESC, id DESC
-        """, (store, month_sort)).fetchall()
+    def adjustment_notes(self, store, months):
+        if not months:
+            return ""
+        rows = self.conn.execute(f"""
+            SELECT month_sort, target_column, item, amount, note
+            FROM adjustments
+            WHERE store=? AND month_sort IN ({",".join("?" for _ in months)})
+            ORDER BY month_sort, id
+        """, [store] + list(months)).fetchall()
+        return "；".join(
+            f"{r['month_sort']} [{r['target_column'] or '备查'}] {r['item']} {money_text(r['amount'])} {r['note'] or ''}".strip()
+            for r in rows
+        )
 
-    def difference_groups(self, store, month_sort):
+    def details(self, store, month_sort=None, months=None, sort_order="ASC"):
+        months = months or ([month_sort] if month_sort else [])
+        if not store or not months:
+            return []
+        order = "DESC" if str(sort_order).upper() == "DESC" else "ASC"
+        return self.conn.execute(f"""
+            SELECT * FROM transactions WHERE store=? AND month_sort IN ({",".join("?" for _ in months)})
+            ORDER BY transaction_time {order}, id {order}
+        """, [store] + list(months)).fetchall()
+
+    def raw_rows_for_export(self, store_filter="", month_filter=""):
+        months = parse_month_filter(month_filter)
+        params = []
+        where = []
+        if store_filter:
+            where.append("store LIKE ?")
+            params.append(f"%{store_filter}%")
+        self._month_where(where, params, months)
+        where_sql = "WHERE " + " AND ".join(where) if where else ""
+        rows = self.conn.execute(f"""
+            SELECT * FROM transactions {where_sql}
+            ORDER BY store, month_sort, transaction_time, id
+        """, params).fetchall()
+        columns = []
+        payloads = []
+        for row in rows:
+            try:
+                payload = json.loads(row["raw_payload"] or "{}")
+            except Exception:
+                payload = {}
+            if not payload:
+                payload = {col: row[col] if col in row.keys() else "" for col in RAW_COLUMNS}
+            for key in payload.keys():
+                if key not in columns:
+                    columns.append(key)
+            payloads.append((row, payload))
+        return columns, payloads
+
+    def difference_groups(self, store, month_sort=None, months=None):
+        months = months or ([month_sort] if month_sort else [])
         rows = self.conn.execute("""
             SELECT direction, summary, COUNT(*) AS count, SUM(amount) AS amount,
                    SUM(paid_settlement) AS paid_settlement,
@@ -496,11 +756,14 @@ class Repository:
                    SUM(tech_fee) AS tech_fee,
                    SUM(commission + tech_fee) AS expense_amount
             FROM transactions
-            WHERE store=? AND month_sort=?
+            WHERE store=? AND month_sort IN (%s)
             GROUP BY direction, summary
             ORDER BY direction, summary
-        """, (store, month_sort)).fetchall()
-        adjs = self.conn.execute("SELECT * FROM adjustments WHERE store=? AND month_sort=? ORDER BY id", (store, month_sort)).fetchall()
+        """ % ",".join("?" for _ in months), [store] + list(months)).fetchall()
+        adjs = self.conn.execute(f"""
+            SELECT * FROM adjustments WHERE store=? AND month_sort IN ({",".join("?" for _ in months)})
+            ORDER BY month_sort, id
+        """, [store] + list(months)).fetchall()
         return rows, adjs
 
 
