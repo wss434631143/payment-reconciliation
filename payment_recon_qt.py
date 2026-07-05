@@ -1200,6 +1200,33 @@ class Repository:
         self.master_conn.execute("UPDATE stores SET active=0 WHERE name=?", (name,))
         self.master_conn.commit()
 
+    def delete_store_permanently(self, name, delete_database=True):
+        """永久删除店铺配置，并可同步删除该店铺独立 SQLite 数据库文件。"""
+
+        name = str(name or "").strip()
+        if not name:
+            raise ValueError("店铺名称不能为空")
+        row = self._master_store_row(name)
+        db_file = row["db_file"] if row else ""
+        if db_file:
+            self._close_store_connection_for_file(db_file)
+        self.master_conn.execute("DELETE FROM stores WHERE name=?", (name,))
+        self.master_conn.execute("DELETE FROM store_configs WHERE store=?", (name,))
+        self.master_conn.execute("DELETE FROM app_settings WHERE key=?", (f"store_config_column_widths:{name}",))
+        self.master_conn.commit()
+        database_deleted = True
+        if delete_database and db_file:
+            db_path = self.store_dir / db_file
+            if db_path.exists():
+                try:
+                    db_path.unlink()
+                except OSError:
+                    database_deleted = False
+        if self.current_store == name:
+            self.conn = self.master_conn
+            self.current_store = ""
+        return {"store_deleted": True, "database_deleted": database_deleted, "db_file": db_file}
+
     def update_store(self, old_name, new_name, note="", active=1):
         old_name = str(old_name or "").strip()
         new_name = str(new_name or "").strip()

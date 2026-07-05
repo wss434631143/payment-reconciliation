@@ -746,15 +746,18 @@ class StoreDialog(QDialog):
 
         add_btn = QPushButton("新增/启用店铺")
         save_btn = QPushButton("保存表格修改")
-        del_btn = QPushButton("停用选中店铺")
+        disable_btn = QPushButton("停用选中店铺")
+        delete_btn = QPushButton("删除选中店铺")
         add_btn.clicked.connect(self.add_store)
         save_btn.clicked.connect(self.save_edits)
-        del_btn.clicked.connect(self.disable_store)
+        disable_btn.clicked.connect(self.disable_store)
+        delete_btn.clicked.connect(self.delete_store)
 
         bar = QHBoxLayout()
         bar.addWidget(add_btn)
         bar.addWidget(save_btn)
-        bar.addWidget(del_btn)
+        bar.addWidget(disable_btn)
+        bar.addWidget(delete_btn)
         bar.addStretch()
 
         layout = QVBoxLayout(self)
@@ -793,6 +796,35 @@ class StoreDialog(QDialog):
             return
         self.repo.delete_store(name)
         self.refresh()
+
+    def delete_store(self):
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "未选择", "请先选择一个店铺。")
+            return
+        name = self.table.item(row, 0).text().strip() if self.table.item(row, 0) else ""
+        if not name:
+            QMessageBox.warning(self, "未选择", "店铺名称不能为空。")
+            return
+        message = (
+            f"确定永久删除店铺：{name}？\n\n"
+            "删除后会移除该店铺配置、历史流水、余额、调整记录和独立数据库文件。"
+        )
+        if QMessageBox.question(self, "确认删除店铺", message) != QMessageBox.Yes:
+            return
+        try:
+            result = self.repo.delete_store_permanently(name, delete_database=True)
+            self.refresh()
+            if result.get("database_deleted", True):
+                QMessageBox.information(self, "删除完成", f"已删除店铺：{name}")
+            else:
+                QMessageBox.warning(
+                    self,
+                    "删除完成",
+                    f"已删除店铺：{name}\n数据库文件当前被占用，关闭程序后可清理：{result.get('db_file', '')}",
+                )
+        except Exception as exc:
+            QMessageBox.critical(self, "删除失败", str(exc))
 
     def save_edits(self):
         try:
