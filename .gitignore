@@ -5,6 +5,7 @@ __pycache__/
 build/
 dist/
 data/
+work/
 *.sqlite3
 *.db
 .venv/

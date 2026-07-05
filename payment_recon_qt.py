@@ -122,6 +122,24 @@ def money(value) -> Decimal:
         return Decimal("0")
 
 
+def is_money_like(value) -> bool:
+    """判断原始单元格是否像金额，避免把日期、流水号等文本误当成公式变量。"""
+
+    if isinstance(value, (int, float, Decimal)):
+        return True
+    text = clean_cell_text(value).strip()
+    if not text:
+        return False
+    text = text.replace(",", "").replace("，", "").replace("￥", "").replace("元", "").strip()
+    if text.startswith("(") and text.endswith(")"):
+        text = "-" + text[1:-1]
+    if text.count(".") > 1:
+        return False
+    if text[0] in "+-":
+        text = text[1:]
+    return bool(text) and all(ch.isdigit() or ch == "." for ch in text) and any(ch.isdigit() for ch in text)
+
+
 def money_text(value) -> str:
     """把金额格式化为带千分位的显示文本。"""
 
@@ -199,6 +217,16 @@ AMOUNT_ALIASES = {
     "佣金": ["佣金", "服务商佣金", "渠道分成", "招商服务费", "站外推广费", "其他分成"],
     "技术服务费": ["技术服务费", "平台服务费"],
 }
+
+ZERO_AMOUNT_FALLBACK_FIELDS = [
+    "订单实付应结", "结算运费", "订单退款", "平台服务费2%(不开票)", "佣金15%-20%(不开票)",
+    "其他扣款(不开票)", "消费者赔付", "实际平台补贴_运费", "实际平台补贴", "其他平台补贴",
+    "以旧换新抵扣", "政府补贴平台垫资", "实际达人补贴", "实际抖音支付补贴",
+    "实际抖音月付营销补贴", "银行补贴", "平台服务费", "佣金", "服务商佣金",
+    "渠道分成", "招商服务费", "站外推广费", "其他分成",
+]
+
+SCENE_FALLBACK_TARGETS = {"其他扣款(不开票)", "消费者赔付", "提现金额"}
 
 
 def difference_reason(row) -> str:
@@ -314,7 +342,7 @@ def parse_formula_lines(text):
         left, right = line.split("=", 1)
         left = left.strip()
         right = right.strip()
-        if left in FIELD_KEYS and right:
+        if left and right:
             formulas.append((left, right))
     return formulas
 
@@ -322,12 +350,12 @@ def parse_formula_lines(text):
 def eval_money_formula(expr, values):
     """在受控变量范围内计算金额公式。"""
 
-    names = sorted(FIELD_KEYS.keys(), key=len, reverse=True)
+    names = sorted([name for name in values.keys() if name], key=len, reverse=True)
     local_vars = {}
     safe_expr = str(expr)
     for idx, name in enumerate(names):
         var = f"v{idx}"
-        local_vars[var] = money(values.get(FIELD_KEYS[name], 0))
+        local_vars[var] = money(values.get(name, 0))
         safe_expr = safe_expr.replace(name, var)
     allowed = set("0123456789.+-*/() _v")
     if any(ch not in allowed for ch in safe_expr):
@@ -524,34 +552,88 @@ class Repository:
     def app_settings(self):
         return [dict(row) for row in self.master_conn.execute("SELECT key, value, updated_at FROM app_settings ORDER BY key").fetchall()]
 
-    def backup_data(self, backup_path, store_names=None, include_settings=True):
-        """把主配置、全局设置和选中店铺数据库打包为 ZIP。"""
+    def backup_data(self, backup_path, store_names=None, include_settings=True, include_databases=True, include_configs=True, progress_callback=None):
+        """按用户选择备份店铺数据库、店铺配置和全局设置。"""
 
         store_names = [str(name).strip() for name in (store_names or []) if str(name).strip()]
+        if not include_databases and not include_configs and not include_settings:
+            raise ValueError("请至少选择一种备份内容")
         if store_names:
             placeholders = ",".join("?" for _ in store_names)
             rows = self.master_conn.execute(f"SELECT * FROM stores WHERE name IN ({placeholders}) ORDER BY name", store_names).fetchall()
         else:
             rows = self.master_conn.execute("SELECT * FROM stores ORDER BY name").fetchall()
         stores = [dict(row) for row in rows]
+        store_configs = {}
+        total_steps = max(1, len(stores) + 2)
+        done_steps = 0
+        if progress_callback:
+            progress_callback("正在准备备份清单...", done_steps, total_steps)
+        if include_configs:
+            previous_store = self.current_store
+            for store in stores:
+                name = store.get("name", "").strip()
+                if name:
+                    if progress_callback:
+                        progress_callback(f"正在读取配置：{name}", done_steps, total_steps)
+                    store_configs[name] = self.store_config(name)
+            if previous_store:
+                self.use_store(previous_store)
+            else:
+                self.conn = self.master_conn
+                self.current_store = ""
+        done_steps += 1
+        if progress_callback:
+            progress_callback("正在写入备份清单...", done_steps, total_steps)
         manifest = {
             "app": "payment_reconciliation_qt",
             "version": "1.0.3",
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "include_settings": bool(include_settings),
-            "stores": stores,
+            "include_databases": bool(include_databases),
+            "include_configs": bool(include_configs),
+            "stores": stores if include_configs else [
+                {
+                    "name": store.get("name", ""),
+                    "db_file": store.get("db_file") or self._default_store_db_file(store.get("name", "")),
+                }
+                for store in stores
+            ],
+            "store_configs": store_configs,
             "settings": self.app_settings() if include_settings else [],
         }
         backup_path = Path(backup_path)
         backup_path.parent.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(backup_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-            for store in stores:
-                db_file = store.get("db_file") or self._default_store_db_file(store.get("name", ""))
-                db_path = self.store_dir / db_file
-                if db_path.exists():
-                    zf.write(db_path, f"stores/{db_file}")
-        return {"stores": len(stores), "path": str(backup_path)}
+            done_steps += 1
+            if progress_callback:
+                progress_callback("备份清单已写入，正在处理店铺数据库...", done_steps, total_steps)
+            if include_databases:
+                for store in stores:
+                    name = store.get("name", "").strip()
+                    db_file = store.get("db_file") or self._default_store_db_file(store.get("name", ""))
+                    db_path = self.store_dir / db_file
+                    if progress_callback:
+                        progress_callback(f"正在备份店铺：{name or db_file}", done_steps, total_steps)
+                    if db_path.exists():
+                        zf.write(db_path, f"stores/{db_file}")
+                    done_steps += 1
+                    if progress_callback:
+                        progress_callback(f"已备份店铺：{name or db_file}", done_steps, total_steps)
+            else:
+                done_steps = total_steps
+                if progress_callback:
+                    progress_callback("备份内容已写入。", done_steps, total_steps)
+        if progress_callback:
+            progress_callback("备份完成。", total_steps, total_steps)
+        return {
+            "stores": len(stores),
+            "path": str(backup_path),
+            "databases": int(bool(include_databases)),
+            "configs": int(bool(include_configs)),
+            "settings": len(manifest["settings"]),
+        }
 
     def inspect_backup(self, backup_path):
         with zipfile.ZipFile(backup_path, "r") as zf:
@@ -571,41 +653,82 @@ class Repository:
             self.current_store = ""
         self.initialized_store_dbs.discard(key)
 
-    def restore_data(self, backup_path, store_names=None, restore_settings=True):
-        """从 ZIP 还原店铺数据库和配置，还原前会关闭相关店铺连接。"""
+    def restore_data(self, backup_path, store_names=None, restore_settings=True, restore_databases=True, restore_configs=True, progress_callback=None):
+        """按用户选择从 ZIP 还原店铺数据库、店铺配置和全局设置。"""
 
         manifest = self.inspect_backup(backup_path)
+        if not restore_databases and not restore_configs and not restore_settings:
+            raise ValueError("请至少选择一种还原内容")
+        if restore_databases and manifest.get("include_databases") is False:
+            raise ValueError("该备份文件不包含店铺数据库")
+        if restore_configs and manifest.get("include_configs") is False:
+            raise ValueError("该备份文件不包含配置")
+        if restore_settings and manifest.get("include_settings") is False:
+            raise ValueError("该备份文件不包含全局设置")
         wanted = {str(name).strip() for name in (store_names or []) if str(name).strip()}
         stores = [store for store in manifest.get("stores", []) if not wanted or store.get("name") in wanted]
+        store_configs = manifest.get("store_configs", {}) or {}
+        total_steps = max(1, len(stores) + 2)
+        done_steps = 0
+        if progress_callback:
+            progress_callback("正在读取备份文件...", done_steps, total_steps)
         with zipfile.ZipFile(backup_path, "r") as zf:
             names = set(zf.namelist())
+            done_steps += 1
+            if progress_callback:
+                progress_callback("备份文件已读取，正在还原店铺...", done_steps, total_steps)
             for store in stores:
                 name = store.get("name", "").strip()
                 if not name:
                     continue
+                if progress_callback:
+                    progress_callback(f"正在还原店铺：{name}", done_steps, total_steps)
                 db_file = store.get("db_file") or self._default_store_db_file(name)
                 member = f"stores/{db_file}"
-                self._close_store_connection_for_file(db_file)
-                if member in names:
+                if restore_databases:
+                    self._close_store_connection_for_file(db_file)
+                if restore_databases and member in names:
                     target = self.store_dir / db_file
                     target.parent.mkdir(parents=True, exist_ok=True)
                     with zf.open(member, "r") as src, open(target, "wb") as dst:
                         dst.write(src.read())
-                self.master_conn.execute("""
-                    INSERT INTO stores (name, note, active, created_at, db_file)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(name) DO UPDATE SET
-                        note=excluded.note,
-                        active=excluded.active,
-                        db_file=excluded.db_file
-                """, (
-                    name,
-                    store.get("note", ""),
-                    int(store.get("active", 1) or 0),
-                    store.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    db_file,
-                ))
+                if restore_configs:
+                    self.master_conn.execute("""
+                        INSERT INTO stores (name, note, active, created_at, db_file)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(name) DO UPDATE SET
+                            note=excluded.note,
+                            active=excluded.active,
+                            db_file=excluded.db_file
+                    """, (
+                        name,
+                        store.get("note", ""),
+                        int(store.get("active", 1) or 0),
+                        store.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        db_file,
+                    ))
+                elif restore_databases:
+                    self.master_conn.execute("""
+                        INSERT INTO stores (name, note, active, created_at, db_file)
+                        VALUES (?, '', 1, ?, ?)
+                        ON CONFLICT(name) DO UPDATE SET db_file=excluded.db_file
+                    """, (name, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), db_file))
+                if restore_configs and name in store_configs:
+                    cfg = store_configs[name]
+                    self.save_store_config(
+                        name,
+                        cfg.get("raw_columns", RAW_COLUMNS),
+                        cfg.get("summary_columns", SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS),
+                        cfg.get("formula_note", DEFAULT_FORMULA_NOTE),
+                        cfg.get("frozen_columns", DEFAULT_FROZEN_COLUMNS),
+                        cfg.get("page_size", 1000),
+                    )
+                done_steps += 1
+                if progress_callback:
+                    progress_callback(f"已还原店铺：{name}", done_steps, total_steps)
         if restore_settings:
+            if progress_callback:
+                progress_callback("正在还原全局设置...", done_steps, total_steps)
             for setting in manifest.get("settings", []):
                 self.master_conn.execute("""
                     INSERT INTO app_settings (key, value, updated_at)
@@ -616,8 +739,18 @@ class Repository:
                     setting.get("value"),
                     setting.get("updated_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ))
+        done_steps = total_steps
+        if progress_callback:
+            progress_callback("正在保存还原结果...", done_steps, total_steps)
         self.master_conn.commit()
-        return {"stores": len(stores), "settings": len(manifest.get("settings", [])) if restore_settings else 0}
+        if progress_callback:
+            progress_callback("还原完成。", total_steps, total_steps)
+        return {
+            "stores": len(stores),
+            "databases": int(bool(restore_databases)),
+            "configs": int(bool(restore_configs)),
+            "settings": len(manifest.get("settings", [])) if restore_settings else 0,
+        }
 
     def _unique_index_columns(self, cur, table):
         result = []
@@ -1338,6 +1471,80 @@ class Repository:
             GROUP BY store, report_type, month_sort
         """, params).fetchall()
 
+    def _raw_money_totals(self, store, months, report_type):
+        """按年月汇总原始表格里的金额型字段，供自定义汇总字段和公式引用。"""
+
+        months = [m for m in (months or []) if m]
+        if not months:
+            return {}
+        params = [store, report_type] + months
+        rows = self.conn.execute(f"""
+            SELECT raw_payload
+            FROM transactions
+            WHERE store=? AND report_type=? AND month_sort IN ({",".join("?" for _ in months)})
+        """, params).fetchall()
+        totals = {}
+        for row in rows:
+            try:
+                payload = json.loads(row["raw_payload"] or "{}")
+            except Exception:
+                payload = {}
+            for field, value in payload.items():
+                field = normalize_config_column(field)
+                if not field or field in SYNTHETIC_RAW_COLUMNS or not is_money_like(value):
+                    continue
+                totals[field] = totals.get(field, Decimal("0.00")) + money(value)
+        return totals
+
+    def _zero_amount_fallback_row(self, payload):
+        """判断一条明细是否所有主要金额字段都是空或 0。"""
+
+        normalized = {normalize_config_column(k): v for k, v in (payload or {}).items()}
+        for field in ZERO_AMOUNT_FALLBACK_FIELDS:
+            value = normalized.get(field, "")
+            if clean_cell_text(value).strip() and money(value) != Decimal("0.00"):
+                return False
+        return True
+
+    def _scene_amount_totals(self, store, months, report_type):
+        """金额字段全空时，按动账场景汇总动账金额，供指定汇总字段兜底取数。"""
+
+        months = [m for m in (months or []) if m]
+        if not months:
+            return {}
+        params = [store, report_type] + months
+        rows = self.conn.execute(f"""
+            SELECT summary, amount, raw_payload
+            FROM transactions
+            WHERE store=? AND report_type=? AND month_sort IN ({",".join("?" for _ in months)})
+        """, params).fetchall()
+        totals = {}
+        for row in rows:
+            try:
+                payload = json.loads(row["raw_payload"] or "{}")
+            except Exception:
+                payload = {}
+            if not self._zero_amount_fallback_row(payload):
+                continue
+            scene = clean_cell_text(row["summary"]).strip()
+            if not scene:
+                continue
+            totals[scene] = totals.get(scene, Decimal("0.00")) + money(row["amount"])
+        return totals
+
+    def _formula_values(self, summary, include_scene=False):
+        """把内置汇总字段和自定义原始字段统一成公式可引用的字段名->金额映射。"""
+
+        values = {}
+        for label, key in FIELD_KEYS.items():
+            values[label] = money(summary.get(key, 0))
+        for label, value in summary.get("custom_values", {}).items():
+            values[label] = money(value)
+        if include_scene:
+            for label, value in summary.get("scene_values", {}).items():
+                values[label] = money(value)
+        return values
+
     def _build_month_summary(self, row):
         """把数据库聚合结果、余额和调整记录组装成单月汇总。"""
 
@@ -1372,6 +1579,8 @@ class Repository:
             "adjustment_notes": self.adjustment_notes(row["store"], [row["month_sort"]], report_type),
             "ending_balance": ending, "account_ending": account_ending, "difference": diff,
         }
+        summary["custom_values"] = self._raw_money_totals(row["store"], [row["month_sort"]], report_type)
+        summary["scene_values"] = self._scene_amount_totals(row["store"], [row["month_sort"]], report_type)
         self.apply_store_formulas(row["store"], summary)
         summary["difference"] = None if summary["account_ending"] is None else summary["ending_balance"] - summary["account_ending"]
         return summary
@@ -1421,6 +1630,8 @@ class Repository:
                 "adjustment_notes": self.adjustment_notes(row["store"], [row["month_sort"]], report_type),
                 "ending_balance": ending, "account_ending": account_ending,
                 "difference": None if account_ending is None else ending - account_ending,
+                "custom_values": {},
+                "scene_values": {},
             }
             self.apply_store_formulas(row["store"], summary)
             summary["difference"] = None if summary["account_ending"] is None else summary["ending_balance"] - summary["account_ending"]
@@ -1455,9 +1666,16 @@ class Repository:
                 "opening_balance": money(first_balance["opening_balance"] if first_balance else store_rows[0]["opening_balance"]),
                 "account_ending": None if not last_balance or last_balance["account_ending_balance"] is None else money(last_balance["account_ending_balance"]),
                 "adjustment_notes": self.adjustment_notes(store, [r["month_sort"] for r in store_rows], report_type),
+                "custom_values": {},
+                "scene_values": {},
             }
             for field in numeric_sum_fields:
                 aggregate[field] = sum((money(r[field]) for r in store_rows), Decimal("0.00"))
+            for row in store_rows:
+                for field, value in row.get("custom_values", {}).items():
+                    aggregate["custom_values"][field] = aggregate["custom_values"].get(field, Decimal("0.00")) + money(value)
+                for field, value in row.get("scene_values", {}).items():
+                    aggregate["scene_values"][field] = aggregate["scene_values"].get(field, Decimal("0.00")) + money(value)
             aggregate["ending_balance"] = (
                 aggregate["opening_balance"] + aggregate["income_total"] +
                 aggregate["expense_amount"] + aggregate["withdraw_amount"]
@@ -1472,12 +1690,21 @@ class Repository:
         """应用店铺自定义计算口径，没有配置时使用默认公式。"""
 
         formulas = parse_formula_lines(self.store_config(store)["formula_note"])
+        values = self._formula_values(summary)
         for target, expr in formulas:
-            key = FIELD_KEYS[target]
             try:
-                summary[key] = eval_money_formula(expr, summary)
+                formula_values = self._formula_values(summary, include_scene=target in SCENE_FALLBACK_TARGETS)
+                formula_values.update(values)
+                if target in SCENE_FALLBACK_TARGETS:
+                    formula_values.update(summary.get("scene_values", {}))
+                result = eval_money_formula(expr, formula_values)
             except Exception:
                 continue
+            if target in FIELD_KEYS:
+                summary[FIELD_KEYS[target]] = result
+            else:
+                summary.setdefault("custom_values", {})[target] = result
+            values[target] = result
 
     def balance_for(self, store, month_sort, report_type="已结算"):
         self.use_store(store)

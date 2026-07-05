@@ -18,8 +18,9 @@ if LOCAL_PYSIDE.exists():
     sys.path.insert(0, str(LOCAL_PYSIDE))
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction, QColor, QFontMetrics, QIcon
+from PySide6.QtGui import QAction, QColor, QFontMetrics, QIcon, QKeySequence
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -36,6 +37,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -121,6 +123,80 @@ def table_item(value, align=Qt.AlignCenter):
     item.setTextAlignment(align)
     item.setFlags(item.flags() ^ Qt.ItemIsEditable)
     return item
+
+
+def editable_table_item(value, align=Qt.AlignLeft | Qt.AlignVCenter):
+    """创建可直接编辑的表格单元格，用在参数配置页。"""
+    item = QTableWidgetItem(str(value))
+    item.setTextAlignment(align)
+    item.setFlags(item.flags() | Qt.ItemIsEditable)
+    return item
+
+
+class CopyableTableWidget(QTableWidget):
+    """支持 Ctrl+C 复制选中单元格的参数配置表格。"""
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.Copy):
+            self.copy_selection()
+            return
+        super().keyPressEvent(event)
+
+    def copy_selection(self):
+        ranges = self.selectedRanges()
+        if not ranges:
+            item = self.currentItem()
+            if item:
+                QApplication.clipboard().setText(item.text())
+            return
+        lines = []
+        for selected in ranges:
+            for row in range(selected.topRow(), selected.bottomRow() + 1):
+                values = []
+                for col in range(selected.leftColumn(), selected.rightColumn() + 1):
+                    item = self.item(row, col)
+                    values.append(item.text() if item else "")
+                lines.append("\t".join(values))
+        QApplication.clipboard().setText("\n".join(lines))
+
+
+class FieldTableWidget(CopyableTableWidget):
+    """字段列表表格：Delete 删除确认，拖动只移动行，不覆盖单元格。"""
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            row = self.currentRow()
+            item = self.item(row, 0) if row >= 0 else None
+            if item and QMessageBox.question(self, "确认删除字段", f"确定删除字段：{item.text()}？") == QMessageBox.Yes:
+                self.removeRow(row)
+            return
+        super().keyPressEvent(event)
+
+    def dropEvent(self, event):
+        source_row = self.currentRow()
+        if source_row < 0 or source_row >= self.rowCount():
+            event.ignore()
+            return
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        target_row = self.rowAt(pos.y())
+        if target_row < 0:
+            target_row = self.rowCount()
+        else:
+            rect = self.visualRect(self.model().index(target_row, 0))
+            if pos.y() > rect.center().y():
+                target_row += 1
+        if target_row == source_row or target_row == source_row + 1:
+            event.accept()
+            return
+        text = self.item(source_row, 0).text() if self.item(source_row, 0) else ""
+        self.removeRow(source_row)
+        if target_row > source_row:
+            target_row -= 1
+        target_row = max(0, min(target_row, self.rowCount()))
+        self.insertRow(target_row)
+        self.setItem(target_row, 0, editable_table_item(text))
+        self.selectRow(target_row)
+        event.accept()
 
 
 class BalanceDialog(QDialog):
@@ -444,7 +520,23 @@ class BackupRestoreDialog(QDialog):
         close_btn.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
         layout.addWidget(tabs)
+        self.progress_label = QLabel("等待操作")
+        self.progress_label.setObjectName("statusPill")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        layout.addWidget(self.progress_label)
+        layout.addWidget(self.progress_bar)
         layout.addWidget(close_btn)
+
+    def set_progress(self, message, value=0, total=100):
+        total = max(1, int(total or 1))
+        value = max(0, min(int(value or 0), total))
+        self.progress_label.setText(message)
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(value)
+        QApplication.processEvents()
 
     def build_store_table(self, rows):
         table = QTableWidget(0, 3)
@@ -475,16 +567,21 @@ class BackupRestoreDialog(QDialog):
     def build_backup_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        info = QLabel("选择要备份的店铺。备份文件会包含所选店铺数据库、店铺主配置和全局设置。")
+        info = QLabel("选择要备份的店铺，并勾选备份内容。可以只备份数据库、只备份配置，或两者都备份。")
         info.setWordWrap(True)
         layout.addWidget(info)
         rows = [dict(row) for row in self.repo.configured_stores(include_inactive=True)]
         self.backup_store_table = self.build_store_table(rows)
         layout.addWidget(self.backup_store_table, 1)
 
-        self.backup_settings_check = QCheckBox("包含全局设置")
+        self.backup_database_check = QCheckBox("备份店铺数据库")
+        self.backup_config_check = QCheckBox("备份全部配置（店铺配置和全局设置）")
+        self.backup_database_check.setChecked(True)
+        self.backup_config_check.setChecked(True)
+        layout.addWidget(self.backup_database_check)
+        layout.addWidget(self.backup_config_check)
+        self.backup_settings_check = self.backup_config_check
         self.backup_settings_check.setChecked(True)
-        layout.addWidget(self.backup_settings_check)
 
         path_row = QHBoxLayout()
         self.backup_path_edit = QLineEdit()
@@ -497,15 +594,15 @@ class BackupRestoreDialog(QDialog):
         path_row.addWidget(browse)
         layout.addLayout(path_row)
 
-        backup_btn = QPushButton("开始备份")
-        backup_btn.clicked.connect(self.run_backup)
-        layout.addWidget(backup_btn)
+        self.backup_btn = QPushButton("开始备份")
+        self.backup_btn.clicked.connect(self.run_backup)
+        layout.addWidget(self.backup_btn)
         return widget
 
     def build_restore_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        info = QLabel("选择备份文件后，可勾选要还原的店铺。还原会覆盖同名店铺的本地数据库。")
+        info = QLabel("选择备份文件后，可勾选要还原的店铺和内容。还原数据库会覆盖同名店铺本地数据库。")
         info.setWordWrap(True)
         layout.addWidget(info)
 
@@ -524,13 +621,17 @@ class BackupRestoreDialog(QDialog):
         self.restore_store_table = self.build_store_table([])
         self.restore_table_layout.addWidget(self.restore_store_table)
         layout.addWidget(self.restore_table_box, 1)
-        self.restore_settings_check = QCheckBox("还原全局设置")
-        self.restore_settings_check.setChecked(True)
-        layout.addWidget(self.restore_settings_check)
+        self.restore_database_check = QCheckBox("还原店铺数据库")
+        self.restore_config_check = QCheckBox("还原全部配置（店铺配置和全局设置）")
+        self.restore_database_check.setChecked(True)
+        self.restore_config_check.setChecked(True)
+        layout.addWidget(self.restore_database_check)
+        layout.addWidget(self.restore_config_check)
+        self.restore_settings_check = self.restore_config_check
 
-        restore_btn = QPushButton("开始还原")
-        restore_btn.clicked.connect(self.run_restore)
-        layout.addWidget(restore_btn)
+        self.restore_btn = QPushButton("开始还原")
+        self.restore_btn.clicked.connect(self.run_restore)
+        layout.addWidget(self.restore_btn)
         return widget
 
     def choose_backup_path(self):
@@ -565,11 +666,30 @@ class BackupRestoreDialog(QDialog):
         if not path:
             QMessageBox.warning(self, "未选择路径", "请选择备份保存路径。")
             return
+        include_database = self.backup_database_check.isChecked()
+        include_config = self.backup_config_check.isChecked()
+        if not include_database and not include_config:
+            QMessageBox.warning(self, "未选择内容", "请至少选择备份店铺数据库或备份全部配置。")
+            return
         try:
-            result = self.repo.backup_data(path, stores, self.backup_settings_check.isChecked())
-            QMessageBox.information(self, "备份完成", f"已备份 {result['stores']} 个店铺。\n文件：{result['path']}")
+            self.backup_btn.setEnabled(False)
+            self.set_progress("正在准备备份...", 0, max(1, len(stores) + 2))
+            result = self.repo.backup_data(
+                path,
+                stores,
+                include_settings=include_config,
+                include_databases=include_database,
+                include_configs=include_config,
+                progress_callback=self.set_progress,
+            )
+            content = "、".join([text for enabled, text in ((include_database, "店铺数据库"), (include_config, "全部配置")) if enabled])
+            self.set_progress(f"备份完成：{result['stores']} 个店铺", 100, 100)
+            QMessageBox.information(self, "备份完成", f"已备份 {result['stores']} 个店铺。\n内容：{content}\n文件：{result['path']}")
         except Exception as exc:
+            self.set_progress(f"备份失败：{exc}", 0, 100)
             QMessageBox.critical(self, "备份失败", str(exc))
+        finally:
+            self.backup_btn.setEnabled(True)
 
     def run_restore(self):
         path = self.restore_path_edit.text().strip()
@@ -580,14 +700,33 @@ class BackupRestoreDialog(QDialog):
         if not stores:
             QMessageBox.warning(self, "未选择店铺", "请至少选择一个要还原的店铺。")
             return
-        if QMessageBox.question(self, "确认还原", "还原会覆盖同名店铺的本地数据库，是否继续？") != QMessageBox.Yes:
+        restore_database = self.restore_database_check.isChecked()
+        restore_config = self.restore_config_check.isChecked()
+        if not restore_database and not restore_config:
+            QMessageBox.warning(self, "未选择内容", "请至少选择还原店铺数据库或还原全部配置。")
+            return
+        content = "、".join([text for enabled, text in ((restore_database, "店铺数据库"), (restore_config, "全部配置")) if enabled])
+        if QMessageBox.question(self, "确认还原", f"将还原：{content}。\n还原数据库会覆盖同名店铺本地数据库，是否继续？") != QMessageBox.Yes:
             return
         try:
-            result = self.repo.restore_data(path, stores, self.restore_settings_check.isChecked())
-            QMessageBox.information(self, "还原完成", f"已还原 {result['stores']} 个店铺。")
+            self.restore_btn.setEnabled(False)
+            self.set_progress("正在准备还原...", 0, max(1, len(stores) + 2))
+            result = self.repo.restore_data(
+                path,
+                stores,
+                restore_settings=restore_config,
+                restore_databases=restore_database,
+                restore_configs=restore_config,
+                progress_callback=self.set_progress,
+            )
+            self.set_progress(f"还原完成：{result['stores']} 个店铺", 100, 100)
+            QMessageBox.information(self, "还原完成", f"已还原 {result['stores']} 个店铺。\n内容：{content}")
             self.accept()
         except Exception as exc:
+            self.set_progress(f"还原失败：{exc}", 0, 100)
             QMessageBox.critical(self, "还原失败", str(exc))
+        finally:
+            self.restore_btn.setEnabled(True)
 
 
 class StoreDialog(QDialog):
@@ -675,11 +814,12 @@ class FieldListEditor(QWidget):
 
     def __init__(self, values, title):
         super().__init__()
-        self.table = QTableWidget(0, 1)
+        self.table = FieldTableWidget(0, 1)
         self.table.setHorizontalHeaderLabels([title])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.SelectedClicked | QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         self.table.setDragDropMode(QTableWidget.InternalMove)
         self.table.setDragDropOverwriteMode(False)
         self.table.setDefaultDropAction(Qt.MoveAction)
@@ -687,20 +827,18 @@ class FieldListEditor(QWidget):
             self.add_value(value)
 
         add_btn = QPushButton("新增字段")
-        edit_btn = QPushButton("修改字段")
         del_btn = QPushButton("删除字段")
         up_btn = QPushButton("上移")
         down_btn = QPushButton("下移")
         top_btn = QPushButton("置顶")
         add_btn.clicked.connect(self.add_dialog)
-        edit_btn.clicked.connect(self.edit_dialog)
         del_btn.clicked.connect(self.delete_selected)
         up_btn.clicked.connect(lambda: self.move_selected(-1))
         down_btn.clicked.connect(lambda: self.move_selected(1))
         top_btn.clicked.connect(self.move_top)
 
         bar = QHBoxLayout()
-        for btn in (add_btn, edit_btn, del_btn, top_btn, up_btn, down_btn):
+        for btn in (add_btn, del_btn, top_btn, up_btn, down_btn):
             bar.addWidget(btn)
         bar.addStretch()
         layout = QVBoxLayout(self)
@@ -713,7 +851,7 @@ class FieldListEditor(QWidget):
             return
         row = self.table.rowCount()
         self.table.insertRow(row)
-        self.table.setItem(row, 0, table_item(value, Qt.AlignLeft | Qt.AlignVCenter))
+        self.table.setItem(row, 0, editable_table_item(value))
 
     def add_dialog(self):
         value, ok = QInputDialog.getText(self, "新增字段", "字段名称")
@@ -727,11 +865,12 @@ class FieldListEditor(QWidget):
         old = self.table.item(row, 0).text()
         value, ok = QInputDialog.getText(self, "修改字段", "字段名称", text=old)
         if ok and value.strip():
-            self.table.setItem(row, 0, table_item(value.strip(), Qt.AlignLeft | Qt.AlignVCenter))
+            self.table.setItem(row, 0, editable_table_item(value.strip()))
 
     def delete_selected(self):
         row = self.table.currentRow()
-        if row >= 0:
+        item = self.table.item(row, 0) if row >= 0 else None
+        if item and QMessageBox.question(self, "确认删除字段", f"确定删除字段：{item.text()}？") == QMessageBox.Yes:
             self.table.removeRow(row)
 
     def move_selected(self, step):
@@ -741,8 +880,8 @@ class FieldListEditor(QWidget):
             return
         current = self.table.takeItem(row, 0).text()
         other = self.table.takeItem(target, 0).text()
-        self.table.setItem(row, 0, table_item(other, Qt.AlignLeft | Qt.AlignVCenter))
-        self.table.setItem(target, 0, table_item(current, Qt.AlignLeft | Qt.AlignVCenter))
+        self.table.setItem(row, 0, editable_table_item(other))
+        self.table.setItem(target, 0, editable_table_item(current))
         self.table.selectRow(target)
 
     def move_top(self):
@@ -752,7 +891,7 @@ class FieldListEditor(QWidget):
         current = self.table.takeItem(row, 0).text()
         self.table.removeRow(row)
         self.table.insertRow(0)
-        self.table.setItem(0, 0, table_item(current, Qt.AlignLeft | Qt.AlignVCenter))
+        self.table.setItem(0, 0, editable_table_item(current))
         self.table.selectRow(0)
 
     def values(self):
@@ -782,10 +921,11 @@ class FormulaEditor(QWidget):
 
     def __init__(self, formula_note):
         super().__init__()
-        self.table = QTableWidget(0, 2)
+        self.table = CopyableTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["汇总字段", "计算公式"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.SelectedClicked | QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
         for line in str(formula_note or "").splitlines():
             if "=" in line:
                 target, expr = line.split("=", 1)
@@ -812,7 +952,7 @@ class FormulaEditor(QWidget):
 
     def delete_selected(self):
         row = self.table.currentRow()
-        if row >= 0:
+        if row >= 0 and QMessageBox.question(self, "确认删除口径", "确定删除选中的计算口径？") == QMessageBox.Yes:
             self.table.removeRow(row)
 
     def text(self):
@@ -832,6 +972,8 @@ class StoreConfigDialog(QDialog):
         super().__init__(parent)
         self.repo = repo
         self.store = store
+        self.initial_state = None
+        self.saved = False
         self.setWindowTitle(f"参数配置 - {store}")
         self.resize(920, 680)
         config = repo.store_config(store)
@@ -879,24 +1021,146 @@ class StoreConfigDialog(QDialog):
 
         hint = QLabel("每行一个字段。原始字段会在导入店铺表格时自动生成初始值，后续可手工调整。")
         hint.setObjectName("mutedLabel")
+        clone_row = QHBoxLayout()
+        self.clone_store_combo = QComboBox()
+        clone_targets = [row["name"] for row in self.repo.configured_stores() if row["name"] != self.store]
+        self.clone_store_combo.addItems(clone_targets)
+        clone_btn = QPushButton("复制到店铺")
+        clone_btn.clicked.connect(self.clone_to_store)
+        clone_row.addWidget(QLabel("参数复制"))
+        clone_row.addWidget(self.clone_store_combo, 1)
+        clone_row.addWidget(clone_btn)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         localize_buttons(buttons, "保存参数", "退出")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
         layout.addWidget(hint)
+        layout.addLayout(clone_row)
         layout.addWidget(tabs, 1)
         layout.addWidget(buttons)
+        self.apply_saved_column_widths()
+        self.initial_state = self.snapshot_state()
 
     def accept(self):
+        if self.save_config():
+            QMessageBox.information(self, "保存成功", "参数配置已保存，可以继续编辑。")
+
+    def reject(self):
+        action = self.confirm_unsaved_close()
+        if action == "save":
+            super().accept()
+        elif action == "discard":
+            super().reject()
+
+    def closeEvent(self, event):
+        action = self.confirm_unsaved_close()
+        if action == "cancel":
+            event.ignore()
+            return
+        event.accept()
+        if action == "save":
+            self.done(QDialog.Accepted)
+
+    def save_config(self):
+        focus = QApplication.focusWidget()
+        if focus:
+            focus.clearFocus()
         raw_columns = self.raw_edit.values()
         summary_columns = self.frozen_summary_edit.values() + self.active_summary_edit.values()
         if not raw_columns or not summary_columns:
             QMessageBox.warning(self, "请补充字段", "原始字段和汇总字段不能为空。")
-            return
+            return False
         frozen_columns = self.frozen_summary_edit.values()
         self.repo.save_store_config(self.store, raw_columns, summary_columns, self.formula_edit.text(), frozen_columns, self.page_size_spin.value())
-        super().accept()
+        self.repo.set_app_setting(self.column_width_setting_key(), json.dumps(self.current_column_widths(), ensure_ascii=False))
+        self.initial_state = self.snapshot_state()
+        self.saved = True
+        return True
+
+    def confirm_unsaved_close(self):
+        if self.snapshot_state() == self.initial_state:
+            return "discard"
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Question)
+        message.setWindowTitle("是否保存参数配置")
+        message.setText("参数配置已有修改，是否保存后关闭？")
+        save_btn = message.addButton("保存并关闭", QMessageBox.AcceptRole)
+        discard_btn = message.addButton("不保存关闭", QMessageBox.DestructiveRole)
+        cancel_btn = message.addButton("继续编辑", QMessageBox.RejectRole)
+        message.setDefaultButton(save_btn)
+        message.exec()
+        clicked = message.clickedButton()
+        if clicked == save_btn:
+            return "save" if self.save_config() else "cancel"
+        if clicked == discard_btn:
+            return "discard"
+        if clicked == cancel_btn:
+            return "cancel"
+        return "cancel"
+
+    def column_width_setting_key(self):
+        return f"store_config_column_widths:{self.store}"
+
+    def config_tables(self):
+        return {
+            "raw": self.raw_edit.table,
+            "frozen": self.frozen_summary_edit.table,
+            "active": self.active_summary_edit.table,
+            "formula": self.formula_edit.table,
+        }
+
+    def current_column_widths(self):
+        result = {}
+        for name, table in self.config_tables().items():
+            result[name] = [table.columnWidth(col) for col in range(table.columnCount())]
+        return result
+
+    def apply_saved_column_widths(self):
+        try:
+            saved = json.loads(self.repo.get_app_setting(self.column_width_setting_key(), "{}") or "{}")
+        except Exception:
+            saved = {}
+        defaults = {
+            "raw": [260],
+            "frozen": [180],
+            "active": [220],
+            "formula": [180, 520],
+        }
+        for name, table in self.config_tables().items():
+            widths = saved.get(name) or defaults.get(name, [])
+            for col, width in enumerate(widths[:table.columnCount()]):
+                table.setColumnWidth(col, max(80, int(width or 0)))
+
+    def snapshot_state(self):
+        return {
+            "raw_columns": self.raw_edit.values(),
+            "frozen_columns": self.frozen_summary_edit.values(),
+            "active_columns": self.active_summary_edit.values(),
+            "formula_note": self.formula_edit.text(),
+            "page_size": self.page_size_spin.value(),
+            "column_widths": self.current_column_widths(),
+        }
+
+    def clone_to_store(self):
+        target = self.clone_store_combo.currentText().strip()
+        if not target:
+            QMessageBox.warning(self, "请选择店铺", "没有可复制的目标店铺。")
+            return
+        if target == self.store:
+            QMessageBox.warning(self, "目标重复", "不能复制到当前店铺。")
+            return
+        if QMessageBox.question(self, "确认复制参数", f"确定把当前参数配置复制到店铺：{target}？\n目标店铺原参数配置会被覆盖。") != QMessageBox.Yes:
+            return
+        raw_columns = self.raw_edit.values()
+        summary_columns = self.frozen_summary_edit.values() + self.active_summary_edit.values()
+        frozen_columns = self.frozen_summary_edit.values()
+        if not raw_columns or not summary_columns:
+            QMessageBox.warning(self, "请补充字段", "原始字段和汇总字段不能为空。")
+            return
+        self.repo.save_store_config(target, raw_columns, summary_columns, self.formula_edit.text(), frozen_columns, self.page_size_spin.value())
+        self.repo.set_app_setting(f"store_config_column_widths:{target}", json.dumps(self.current_column_widths(), ensure_ascii=False))
+        QMessageBox.information(self, "复制完成", f"已把当前参数配置复制到店铺：{target}")
 
     def move_to_frozen(self):
         value = self.active_summary_edit.selected_value()
@@ -1062,13 +1326,13 @@ class MainWindow(QMainWindow):
         self.addToolBar(toolbar)
         for text, handler in [
             ("导入流水", self.import_excel),
-            ("店铺", self.manage_stores),
-            ("参数", self.configure_current_store),
-            ("余额", self.edit_balance),
+            ("店铺配置", self.manage_stores),
+            ("参数配置", self.configure_current_store),
+            ("录入余额", self.edit_balance),
             ("调整", self.add_adjustment),
-            ("差异", self.show_difference),
+            ("差异调整", self.show_difference),
             ("导出", self.export_summary),
-            ("备份", self.open_backup_restore),
+            ("备份及还原", self.open_backup_restore),
             ("设置", self.open_global_settings),
         ]:
             action = QAction(text, self)
@@ -1591,7 +1855,12 @@ class MainWindow(QMainWindow):
             "差异原因": difference_reason(row),
             "调整说明": row.get("adjustment_notes", ""),
         }
-        return values.get(header, "")
+        if header in values:
+            return values[header]
+        custom_values = row.get("custom_values", {}) or {}
+        if header in custom_values:
+            return money_text(custom_values[header])
+        return ""
 
     def auto_fit(self, table, max_width=280):
         table.resizeColumnsToContents()
@@ -1873,7 +2142,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "未选择店铺", "请先选择店铺。")
             return
         dialog = StoreConfigDialog(self, self.repo, store)
-        if dialog.exec() == QDialog.Accepted:
+        result = dialog.exec()
+        if result == QDialog.Accepted or dialog.saved:
             self.clear_loaded_data("参数配置已保存。点击“查询”重新加载当前店铺数据。")
 
     def import_excel(self):

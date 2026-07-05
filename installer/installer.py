@@ -16,8 +16,8 @@ from tkinter import filedialog, messagebox
 
 
 APP_NAME = "财务第三方支付核对"
-APP_VERSION = "1.0.3"
-APP_EXE_NAME = "财务第三方支付核对-Qt版-v1.0.3.exe"
+APP_VERSION = "1.0.4"
+APP_EXE_NAME = "财务第三方支付核对-Qt版-v1.0.4.exe"
 APP_FOLDER_NAME = "PaymentReconciliationQt"
 PUBLISHER = "wss434631143"
 
