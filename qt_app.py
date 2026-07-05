@@ -1076,8 +1076,9 @@ class MainWindow(QMainWindow):
 
         title = QLabel("财务第三方支付核对")
         title.setObjectName("titleLabel")
-        subtitle = QLabel("Qt 版桌面客户端 · SQLite 落盘 · 店铺/月度核对 · 手工调整留痕")
-        subtitle.setObjectName("subtitleLabel")
+        subtitle = QLabel("当前视图按店铺和报表类型隔离数据：先选择店铺、报表类型，再导入、查询、录入余额和调整差异。参数配置可按店铺单独维护。")
+        subtitle.setObjectName("formulaLabel")
+        subtitle.setWordWrap(True)
         root_layout.addWidget(title)
         root_layout.addWidget(subtitle)
 
@@ -1155,11 +1156,14 @@ class MainWindow(QMainWindow):
         self.detail_splitter.addWidget(self.detail_table)
         detail_controls = QWidget()
         detail_controls_layout = QVBoxLayout(detail_controls)
-        detail_controls_layout.setContentsMargins(0, 8, 0, 0)
-        detail_controls_layout.setSpacing(6)
+        detail_controls_layout.setContentsMargins(0, 6, 0, 0)
+        detail_controls_layout.setSpacing(4)
         detail_filter_bar = QHBoxLayout()
         detail_status_bar = QHBoxLayout()
         detail_action_bar = QHBoxLayout()
+        detail_filter_bar.setSpacing(4)
+        detail_status_bar.setSpacing(4)
+        detail_action_bar.setSpacing(4)
         edit_tx = QPushButton("编辑选中流水")
         del_tx = QPushButton("删除选中流水")
         del_month = QPushButton("删除选中年月流水")
@@ -1248,11 +1252,6 @@ class MainWindow(QMainWindow):
         status_row.addWidget(self.status)
         status_row.addStretch()
         root_layout.addLayout(status_row)
-
-        formula = QLabel("当前视图按店铺和报表类型隔离数据：先选择店铺、报表类型，再导入、查询、录入余额和调整差异。参数配置可按店铺单独维护。")
-        formula.setObjectName("formulaLabel")
-        formula.setWordWrap(True)
-        root_layout.addWidget(formula)
         self.setCentralWidget(root)
 
     def configure_table(self, table):
@@ -1372,10 +1371,10 @@ class MainWindow(QMainWindow):
     def apply_style(self):
         self.setStyleSheet("""
             QMainWindow, QWidget { background: #f5f7fb; color: #1f2937; font-family: "Microsoft YaHei"; font-size: 12px; }
-            QToolBar { background: #ffffff; border-bottom: 1px solid #d9e2ef; spacing: 4px; padding: 6px; }
-            QToolButton { background: #2563eb; color: #ffffff; border: none; border-radius: 6px; padding: 6px 9px; }
+            QToolBar { background: #ffffff; border-bottom: 1px solid #d9e2ef; spacing: 2px; padding: 4px; }
+            QToolButton { background: #2563eb; color: #ffffff; border: none; border-radius: 6px; padding: 5px 8px; margin: 0px; }
             QToolButton:hover { background: #1d4ed8; }
-            QPushButton { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 7px 12px; }
+            QPushButton { background: #ffffff; border: 1px solid #cbd5e1; border-radius: 6px; padding: 5px 8px; margin: 0px; }
             QPushButton:hover { background: #eff6ff; border-color: #93c5fd; }
             QLineEdit, QComboBox { background: #ffffff; border: 1px solid #b8c3d4; border-radius: 6px; padding: 7px 12px; min-height: 20px; }
             QComboBox { padding-right: 34px; }

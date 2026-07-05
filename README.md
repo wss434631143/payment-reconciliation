@@ -95,7 +95,8 @@ python qt_app.py
 
 正式发布包包含：
 
+- `payment-reconciliation-qt-v1.0.3-setup.exe`
 - `财务第三方支付核对-Qt版-v1.0.3.exe`
 - `RELEASE_NOTES_v1.0.3.md`
 
-下载 exe 后可直接运行。数据默认保存在 exe 同级目录下的 `data` 文件夹中。
+推荐下载 `setup.exe` 安装包，它会一步步安装程序，并创建桌面图标、开始菜单入口和卸载入口。也可以下载单文件 exe 直接运行；直接运行时数据默认保存在 exe 同级目录下的 `data` 文件夹中。

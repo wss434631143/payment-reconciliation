@@ -35,5 +35,8 @@
 
 ## 发布包
 
+- `payment-reconciliation-qt-v1.0.3-setup.exe`
 - `财务第三方支付核对-Qt版.exe`
 - `RELEASE_NOTES_v1.0.3.md`
+
+推荐使用 `setup.exe` 安装包，它会创建桌面图标、开始菜单入口和卸载入口；单文件 exe 仍保留给免安装使用场景。
