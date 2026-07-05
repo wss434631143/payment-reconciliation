@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -37,16 +39,20 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 
 from payment_recon_qt import (
     ADJUSTABLE_COLUMNS,
     DB_PATH,
     RAW_COLUMNS,
     SUMMARY_COLUMNS,
+    SUMMARY_EXTRA_COLUMNS,
     Repository,
     difference_reason,
     money,
     money_text,
+    parse_month_filter,
 )
 
 
@@ -180,6 +186,40 @@ class TransactionDialog(QDialog):
         super().accept()
 
 
+class MonthSelectDialog(QDialog):
+    def __init__(self, parent, months, selected):
+        super().__init__(parent)
+        self.setWindowTitle("选择月份")
+        self.resize(360, 460)
+        self.result_months = None
+        selected = set(selected)
+        self.list_widget = QListWidget()
+        for month in months:
+            label = f"{month['month_sort']} {month['month_label']}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, month["month_sort"])
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if month["month_sort"] in selected else Qt.Unchecked)
+            self.list_widget.addItem(item)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("可多选月份，查询后会显示区间合计和单月明细行。"))
+        layout.addWidget(self.list_widget)
+        layout.addWidget(buttons)
+
+    def accept(self):
+        months = []
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.checkState() == Qt.Checked:
+                months.append(item.data(Qt.UserRole))
+        self.result_months = months
+        super().accept()
+
+
 class StoreDialog(QDialog):
     def __init__(self, parent, repo):
         super().__init__(parent)
@@ -194,12 +234,15 @@ class StoreDialog(QDialog):
 
         add_btn = QPushButton("新增/启用店铺")
         del_btn = QPushButton("停用选中店铺")
+        config_btn = QPushButton("字段/口径配置")
         add_btn.clicked.connect(self.add_store)
         del_btn.clicked.connect(self.disable_store)
+        config_btn.clicked.connect(self.edit_config)
 
         bar = QHBoxLayout()
         bar.addWidget(add_btn)
         bar.addWidget(del_btn)
+        bar.addWidget(config_btn)
         bar.addStretch()
 
         layout = QVBoxLayout(self)
@@ -238,6 +281,56 @@ class StoreDialog(QDialog):
         self.repo.delete_store(name)
         self.refresh()
 
+    def edit_config(self):
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "未选择", "请先选择一个店铺。")
+            return
+        name = self.table.item(row, 0).text()
+        dialog = StoreConfigDialog(self, self.repo, name)
+        if dialog.exec() == QDialog.Accepted:
+            self.refresh()
+
+
+class StoreConfigDialog(QDialog):
+    def __init__(self, parent, repo, store):
+        super().__init__(parent)
+        self.repo = repo
+        self.store = store
+        self.setWindowTitle(f"字段/口径配置 - {store}")
+        self.resize(760, 620)
+        config = repo.store_config(store)
+        self.raw_edit = QTextEdit("\n".join(config["raw_columns"]))
+        self.summary_edit = QTextEdit("\n".join(config["summary_columns"]))
+        self.formula_edit = QTextEdit(config["formula_note"])
+
+        tabs = QTabWidget()
+        tabs.addTab(self.raw_edit, "原始表格字段")
+        tabs.addTab(self.summary_edit, "汇总表格字段")
+        tabs.addTab(self.formula_edit, "计算口径")
+
+        hint = QLabel("每行一个字段。原始字段会在导入店铺表格时自动生成初始值，后续可手工调整。")
+        hint.setObjectName("mutedLabel")
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(hint)
+        layout.addWidget(tabs, 1)
+        layout.addWidget(buttons)
+
+    def _lines(self, edit):
+        return [line.strip() for line in edit.toPlainText().splitlines() if line.strip()]
+
+    def accept(self):
+        raw_columns = self._lines(self.raw_edit)
+        summary_columns = self._lines(self.summary_edit)
+        if not raw_columns or not summary_columns:
+            QMessageBox.warning(self, "请补充字段", "原始字段和汇总字段不能为空。")
+            return
+        self.repo.save_store_config(self.store, raw_columns, summary_columns, self.formula_edit.toPlainText().strip())
+        super().accept()
+
 
 class DifferenceDialog(QDialog):
     def __init__(self, parent, repo, row):
@@ -245,7 +338,7 @@ class DifferenceDialog(QDialog):
         self.setWindowTitle(f"差异明细 - {row['store']} {row['month_label']}")
         self.resize(1060, 680)
 
-        groups, adjustments = repo.difference_groups(row["store"], row["month_sort"])
+        groups, adjustments = repo.difference_groups(row["store"], months=row.get("month_sorts") or [row["month_sort"]])
         text = QPlainTextEdit()
         text.setReadOnly(True)
         text.setFont(QFont("Consolas", 10))
@@ -299,6 +392,7 @@ class MainWindow(QMainWindow):
         self.repo = Repository(DB_PATH)
         self.summary_rows = []
         self.current_summary_key = None
+        self.detail_sort_order = "ASC"
         self.setWindowTitle(APP_TITLE)
         self.resize(1480, 920)
         self.build_ui()
@@ -339,15 +433,18 @@ class MainWindow(QMainWindow):
         self.store_filter = QLineEdit()
         self.store_filter.setPlaceholderText("按店铺筛选")
         self.month_filter = QLineEdit()
-        self.month_filter.setPlaceholderText("按月份筛选，如 2026-06")
+        self.month_filter.setPlaceholderText("按月份筛选，如 2026-06 或 202606-202607")
+        month_pick_btn = QPushButton("选择月份")
         search_btn = QPushButton("查询")
         clear_btn = QPushButton("清空")
+        month_pick_btn.clicked.connect(self.select_months)
         search_btn.clicked.connect(self.refresh_all)
         clear_btn.clicked.connect(self.clear_filters)
         filter_layout.addWidget(QLabel("店铺"))
         filter_layout.addWidget(self.store_filter, 1)
         filter_layout.addWidget(QLabel("月份"))
         filter_layout.addWidget(self.month_filter, 1)
+        filter_layout.addWidget(month_pick_btn)
         filter_layout.addWidget(search_btn)
         filter_layout.addWidget(clear_btn)
         root_layout.addWidget(filter_bar)
@@ -363,9 +460,9 @@ class MainWindow(QMainWindow):
         summary_layout.addWidget(summary_title)
         summary_tables = QHBoxLayout()
         self.summary_fixed = QTableWidget(0, 2)
-        self.summary_scroll = QTableWidget(0, len(SUMMARY_COLUMNS[2:]) + 3)
+        self.summary_scroll = QTableWidget(0, len(SUMMARY_COLUMNS[2:]) + len(SUMMARY_EXTRA_COLUMNS))
         self.summary_fixed.setHorizontalHeaderLabels(SUMMARY_COLUMNS[:2])
-        self.summary_scroll.setHorizontalHeaderLabels(SUMMARY_COLUMNS[2:] + ["店铺期末余额", "差异", "差异原因"])
+        self.summary_scroll.setHorizontalHeaderLabels(SUMMARY_COLUMNS[2:] + SUMMARY_EXTRA_COLUMNS)
         self.configure_table(self.summary_fixed)
         self.configure_table(self.summary_scroll)
         self.summary_fixed.setFixedWidth(220)
@@ -390,12 +487,15 @@ class MainWindow(QMainWindow):
         self.configure_table(self.detail_table)
         detail_layout.addWidget(self.detail_table, 1)
         detail_bar = QHBoxLayout()
+        self.sort_btn = QPushButton("动账时间：升序")
         edit_tx = QPushButton("编辑选中流水")
         del_tx = QPushButton("删除选中流水")
         del_month = QPushButton("删除选中月份流水")
+        self.sort_btn.clicked.connect(self.toggle_detail_sort)
         edit_tx.clicked.connect(self.edit_transaction)
         del_tx.clicked.connect(self.delete_transaction)
         del_month.clicked.connect(self.delete_month)
+        detail_bar.addWidget(self.sort_btn)
         detail_bar.addWidget(edit_tx)
         detail_bar.addWidget(del_tx)
         detail_bar.addWidget(del_month)
@@ -446,34 +546,42 @@ class MainWindow(QMainWindow):
         self.month_filter.clear()
         self.refresh_all()
 
+    def select_months(self):
+        dialog = MonthSelectDialog(self, self.repo.months(), parse_month_filter(self.month_filter.text()))
+        if dialog.exec() == QDialog.Accepted:
+            self.month_filter.setText(",".join(dialog.result_months or []))
+            self.refresh_all()
+
+    def toggle_detail_sort(self):
+        self.detail_sort_order = "DESC" if self.detail_sort_order == "ASC" else "ASC"
+        self.sort_btn.setText("动账时间：降序" if self.detail_sort_order == "DESC" else "动账时间：升序")
+        row = self.selected_summary()
+        if row:
+            self.refresh_details(row)
+
     def refresh_all(self):
         self.refresh_summary()
-        self.refresh_details(None)
+        if self.summary_rows:
+            self.summary_fixed.selectRow(0)
+            self.summary_scroll.selectRow(0)
+            self.select_summary_row(0)
+        else:
+            self.refresh_details(None)
 
     def refresh_summary(self):
         self.summary_rows = self.repo.monthly_summaries(self.store_filter.text().strip(), self.month_filter.text().strip())
+        headers = self.current_summary_columns()
+        frozen_headers = headers[:2]
+        scroll_headers = headers[2:]
+        self.summary_fixed.setColumnCount(len(frozen_headers))
+        self.summary_scroll.setColumnCount(len(scroll_headers))
+        self.summary_fixed.setHorizontalHeaderLabels(frozen_headers)
+        self.summary_scroll.setHorizontalHeaderLabels(scroll_headers)
         self.summary_fixed.setRowCount(len(self.summary_rows))
         self.summary_scroll.setRowCount(len(self.summary_rows))
         for row_idx, row in enumerate(self.summary_rows):
-            fixed_values = [row["store"], row["month_label"]]
-            scroll_values = [
-                money_text(row["paid_settlement"]),
-                money_text(row["platform_subsidy"]),
-                money_text(row["merchant_subsidy"]),
-                money_text(row["freight"]),
-                money_text(row["refund"]),
-                money_text(row["income_total"]),
-                money_text(row["commission"]),
-                money_text(row["tech_fee"]),
-                money_text(row["expense_amount"]),
-                money_text(row["settlement_amount"]),
-                money_text(row["withdraw_amount"]),
-                money_text(row["opening_balance"]),
-                money_text(row["ending_balance"]),
-                "" if row["account_ending"] is None else money_text(row["account_ending"]),
-                "" if row["difference"] is None else money_text(row["difference"]),
-                difference_reason(row),
-            ]
+            fixed_values = [self.summary_value(row, header) for header in frozen_headers]
+            scroll_values = [self.summary_value(row, header) for header in scroll_headers]
             has_diff = row["difference"] is not None and row["difference"] != Decimal("0.00")
             bg = QColor("#fff1f0") if has_diff else None
             for col, value in enumerate(fixed_values):
@@ -489,6 +597,43 @@ class MainWindow(QMainWindow):
         self.auto_fit(self.summary_fixed, max_width=130)
         self.auto_fit(self.summary_scroll, max_width=260)
         self.status.setText(f"数据库：{DB_PATH}    汇总 {len(self.summary_rows)} 条")
+
+    def current_summary_columns(self):
+        store = self.store_filter.text().strip()
+        stores = self.repo.stores()
+        if store in stores:
+            columns = self.repo.store_config(store)["summary_columns"]
+        else:
+            columns = SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS
+        if "店铺" not in columns:
+            columns.insert(0, "店铺")
+        if "月份" not in columns:
+            columns.insert(1, "月份")
+        return columns
+
+    def summary_value(self, row, header):
+        values = {
+            "店铺": row["store"],
+            "月份": row["month_label"],
+            "订单实付应结": money_text(row["paid_settlement"]),
+            "平台补贴": money_text(row["platform_subsidy"]),
+            "商家补贴": money_text(row["merchant_subsidy"]),
+            "结算运费": money_text(row["freight"]),
+            "订单退款": money_text(row["refund"]),
+            "收入净额合计": money_text(row["income_total"]),
+            "已结算佣金": money_text(row["commission"]),
+            "技术服务费": money_text(row["tech_fee"]),
+            "支出金额": money_text(row["expense_amount"]),
+            "结算金额": money_text(row["settlement_amount"]),
+            "提现金额": money_text(row["withdraw_amount"]),
+            "期初金额": money_text(row["opening_balance"]),
+            "结算期末余额": money_text(row["ending_balance"]),
+            "店铺期末余额": "" if row["account_ending"] is None else money_text(row["account_ending"]),
+            "差异": "" if row["difference"] is None else money_text(row["difference"]),
+            "差异原因": difference_reason(row),
+            "调整说明": row.get("adjustment_notes", ""),
+        }
+        return values.get(header, "")
 
     def auto_fit(self, table, max_width=280):
         table.resizeColumnsToContents()
@@ -514,10 +659,10 @@ class MainWindow(QMainWindow):
             self.refresh_details(None)
             return
         selected = self.summary_rows[row]
-        key = (selected["store"], selected["month_sort"])
+        key = (selected["store"], selected["month_sort"], tuple(selected.get("month_sorts", [])))
         if key != self.current_summary_key:
             self.current_summary_key = key
-            self.refresh_details(key)
+            self.refresh_details(selected)
 
     def selected_summary(self):
         row = self.summary_scroll.currentRow()
@@ -527,11 +672,11 @@ class MainWindow(QMainWindow):
             return self.summary_rows[row]
         return None
 
-    def refresh_details(self, key):
+    def refresh_details(self, row):
         self.detail_table.setRowCount(0)
-        if not key:
+        if not row:
             return
-        rows = self.repo.details(key[0], key[1])
+        rows = self.repo.details(row["store"], months=row.get("month_sorts") or [row["month_sort"]], sort_order=self.detail_sort_order)
         self.detail_table.setRowCount(len(rows))
         for r, row in enumerate(rows):
             values = [
@@ -671,23 +816,30 @@ class MainWindow(QMainWindow):
         self.refresh_all()
 
     def export_summary(self):
-        path, _ = QFileDialog.getSaveFileName(self, "保存汇总CSV", "支付核对汇总.csv", "CSV 文件 (*.csv)")
+        path, _ = QFileDialog.getSaveFileName(self, "保存汇总表", "支付核对汇总.xlsx", "Excel 文件 (*.xlsx)")
         if not path:
             return
+        if not path.lower().endswith(".xlsx"):
+            path += ".xlsx"
         rows = self.repo.monthly_summaries(self.store_filter.text().strip(), self.month_filter.text().strip())
-        with open(path, "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.writer(f)
-            writer.writerow(SUMMARY_COLUMNS + ["店铺期末余额", "差异", "差异原因"])
-            for row in rows:
-                writer.writerow([
-                    row["store"], row["month_label"], row["paid_settlement"],
-                    row["platform_subsidy"], row["merchant_subsidy"], row["freight"], row["refund"],
-                    row["income_total"], row["commission"], row["tech_fee"], row["expense_amount"],
-                    row["settlement_amount"], row["withdraw_amount"], row["opening_balance"], row["ending_balance"],
-                    "" if row["account_ending"] is None else row["account_ending"],
-                    "" if row["difference"] is None else row["difference"],
-                    difference_reason(row),
-                ])
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "汇总表"
+        headers = self.current_summary_columns()
+        ws.append(headers)
+        for row in rows:
+            ws.append([self.summary_value(row, header) for header in headers])
+        raw_headers, raw_payloads = self.repo.raw_rows_for_export(self.store_filter.text().strip(), self.month_filter.text().strip())
+        raw_ws = wb.create_sheet("原始表格")
+        raw_ws.append(["店铺", "月份排序"] + raw_headers)
+        for tx, payload in raw_payloads:
+            raw_ws.append([tx["store"], tx["month_sort"]] + [payload.get(header, "") for header in raw_headers])
+        for sheet in wb.worksheets:
+            for col_idx, column_cells in enumerate(sheet.columns, start=1):
+                max_len = max(len(str(cell.value or "")) for cell in column_cells)
+                sheet.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 2, 10), 42)
+            sheet.freeze_panes = "C2" if sheet.title == "汇总表" else "A2"
+        wb.save(path)
         QMessageBox.information(self, "导出完成", f"已保存：{path}")
 
 
