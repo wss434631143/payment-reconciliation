@@ -838,7 +838,9 @@ class StoreConfigDialog(QDialog):
         summary_columns = list(config["summary_columns"])
         frozen_columns = [col for col in config.get("frozen_columns", summary_columns[:2]) if col in summary_columns]
         if not frozen_columns:
-            frozen_columns = summary_columns[:2] if len(summary_columns) >= 2 else ["店铺", "月份"]
+            frozen_columns = [col for col in ("店铺", "报表类型", "年月") if col in summary_columns]
+            if not frozen_columns:
+                frozen_columns = summary_columns[:2] if len(summary_columns) >= 2 else ["店铺", "年月"]
         active_columns = [col for col in summary_columns if col not in frozen_columns]
         self.raw_edit = FieldListEditor(config["raw_columns"], "原始表格字段")
         self.frozen_summary_edit = FieldListEditor(frozen_columns, "冻结栏字段")
@@ -1039,8 +1041,12 @@ class MainWindow(QMainWindow):
         self.force_quit = False
         self.setWindowTitle(APP_TITLE)
         icon_path = resource_path("assets/app_icon.ico")
-        if icon_path.exists():
-            self.setWindowIcon(QIcon(str(icon_path)))
+        app_icon = QIcon(str(icon_path)) if icon_path.exists() else QIcon(str(sys.executable))
+        if not app_icon.isNull():
+            self.setWindowIcon(app_icon)
+            app = QApplication.instance()
+            if app:
+                app.setWindowIcon(app_icon)
         self.resize(1480, 920)
         self.build_ui()
         self.apply_style()
@@ -1226,7 +1232,7 @@ class MainWindow(QMainWindow):
         detail_action_bar.addWidget(self.detail_page_edit)
         detail_action_bar.addWidget(page_jump_btn)
         detail_action_bar.addWidget(self.detail_page_label)
-        detail_action_bar.addSpacing(16)
+        detail_action_bar.addSpacing(6)
         detail_action_bar.addWidget(edit_tx)
         detail_action_bar.addWidget(del_tx)
         detail_action_bar.addWidget(del_month)
@@ -1546,8 +1552,9 @@ class MainWindow(QMainWindow):
             columns = SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS
         if "店铺" not in columns:
             columns.insert(0, "店铺")
-        if "月份" not in columns and "年月" not in columns:
-            columns.insert(1, "月份")
+        if "年月" not in columns:
+            insert_at = 2 if "报表类型" in columns else 1
+            columns.insert(insert_at, "年月")
         return columns
 
     def current_frozen_columns(self, headers=None):
@@ -1841,7 +1848,7 @@ class MainWindow(QMainWindow):
         except Exception:
             payload = {}
         fallback = {
-            "店铺": tx["store"], "月份": tx["month_label"], "动账时间": tx["transaction_time"],
+            "店铺": tx["store"], "月份": tx["month_label"], "年月": tx["month_label"], "动账时间": tx["transaction_time"],
             "报表类型": tx["report_type"],
             "动账流水号": tx["flow_id"], "动账方向": tx["direction"], "动账账户": tx["account"],
             "动账金额": money_text(tx["amount"]), "动账摘要": tx["summary"], "业务类型": tx["biz_type"],

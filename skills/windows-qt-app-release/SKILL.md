@@ -20,6 +20,10 @@ description: 用于开发、优化、打包、记录和发布 Windows Qt/PySide6
 
 详细检查清单见 `references/windows-qt-release-checklist.md`。
 
+## 可复用脚本
+
+- `scripts/create_usage_gif.py`：基于真实 Qt 窗口截图生成 README 使用动图。需要生成或更新程序演示 GIF 时，先复制到目标 Qt 项目的 `scripts/` 目录，再按项目模块名、窗口类和演示步骤做少量适配后运行。
+
 ## UI 设计规则
 
 - 财务和运营工具优先采用“店铺/主体优先”的布局，先选对象，再看汇总和明细。

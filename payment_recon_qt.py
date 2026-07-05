@@ -39,17 +39,19 @@ REPORT_TYPES = ["已结算", "未结算"]
 
 # 默认汇总字段。每个店铺后续可在参数配置中单独调整。
 SUMMARY_COLUMNS = [
-    "店铺", "报表类型", "月份", "订单实付应结", "平台补贴", "商家补贴", "结算运费", "订单退款",
+    "店铺", "报表类型", "年月", "订单实付应结", "平台补贴", "商家补贴", "结算运费", "订单退款",
     "收入净额合计", "已结算佣金", "技术服务费", "支出金额", "结算金额", "提现金额", "期初金额", "结算期末余额",
 ]
+DEFAULT_FROZEN_COLUMNS = ["店铺", "报表类型", "年月"]
 
 # 默认原始流水字段。导入时会根据实际表头补充每个店铺自己的字段配置。
 RAW_COLUMNS = [
-    "店铺", "月份", "动账时间", "动账流水号", "动账方向", "动账账户", "动账金额",
+    "店铺", "报表类型", "年月", "动账时间", "动账流水号", "动账方向", "动账账户", "动账金额",
     "动账摘要", "业务类型", "主订单编号", "子订单编号", "售后单号", "下单时间",
     "商品信息", "商品编码", "售卖类型", "订单实付应结", "平台补贴", "商家补贴",
     "结算运费", "订单退款", "佣金", "技术服务费",
 ]
+SYNTHETIC_RAW_COLUMNS = ["店铺", "报表类型", "年月"]
 
 # 手工调整可以影响的汇总字段；“备查”只记录说明，不改变汇总金额。
 ADJUSTABLE_COLUMNS = [
@@ -140,7 +142,7 @@ def normalize_header(value) -> str:
 
 HEADER_ALIASES = {
     "店铺": ["店铺"],
-    "月份": ["动账时间1", "动帐时间1", "月份", "账期", "帐期"],
+    "月份": ["动账时间1", "动帐时间1", "年月", "月份", "账期", "帐期"],
     "动账时间": ["动账时间", "动帐时间", "交易时间", "发生时间"],
     "动账流水号": ["动账流水号", "动帐流水号", "流水号", "资金流水号"],
     "动账方向": ["动账方向", "动帐方向", "收支方向"],
@@ -156,6 +158,37 @@ HEADER_ALIASES = {
     "商品编码": ["商品编码", "商品ID"],
     "售卖类型": ["售卖类型", "订单类型"],
 }
+
+
+def normalize_config_column(name):
+    """把旧配置中的“月份”迁移为界面统一使用的“年月”。"""
+
+    text = str(name or "").strip()
+    return "年月" if text in ("月份", "动账时间1") else text
+
+
+def normalized_columns(columns, fallback=None):
+    """去重并保持字段顺序，用于店铺字段配置读写。"""
+
+    values = []
+    source = columns or fallback or []
+    for column in source:
+        column = normalize_config_column(column)
+        if column and column not in values:
+            values.append(column)
+    return values
+
+
+def enrich_raw_payload(payload, store, report_type, month_label, month_sort):
+    """给原始表格补齐系统导入时已知但源文件可能没有的字段。"""
+
+    payload = dict(payload or {})
+    payload["店铺"] = store
+    payload["报表类型"] = report_type
+    payload["年月"] = month_label or month_sort
+    # 兼容历史配置和历史导出模板，旧字段仍可读取到同一份年月值。
+    payload.setdefault("月份", month_label or month_sort)
+    return payload
 
 AMOUNT_ALIASES = {
     "订单实付应结": ["订单实付应结"],
@@ -467,7 +500,7 @@ class Repository:
         """, (
             json.dumps(RAW_COLUMNS, ensure_ascii=False),
             json.dumps(SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS, ensure_ascii=False),
-            json.dumps(SUMMARY_COLUMNS[:3], ensure_ascii=False),
+            json.dumps(DEFAULT_FROZEN_COLUMNS, ensure_ascii=False),
             1000,
             DEFAULT_FORMULA_NOTE,
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -848,6 +881,7 @@ class Repository:
                     for i in range(len(headers))
                     if headers[i]
                 }
+                raw_payload = enrich_raw_payload(raw_payload, store, report_type, month_label, month_sort)
                 values = (
                     Path(path).name, now, store, report_type, month_label, month_sort,
                     transaction_time, flow_id,
@@ -964,6 +998,7 @@ class Repository:
                             for i in range(len(headers))
                             if headers[i]
                         }
+                        raw_payload = enrich_raw_payload(raw_payload, store, report_type, month_label, month_sort)
                         values = (
                             source_name, now, store, report_type, month_label, month_sort,
                             transaction_time, flow_id,
@@ -1091,7 +1126,7 @@ class Repository:
             store,
             json.dumps(RAW_COLUMNS, ensure_ascii=False),
             json.dumps(SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS, ensure_ascii=False),
-            json.dumps(SUMMARY_COLUMNS[:3], ensure_ascii=False),
+            json.dumps(DEFAULT_FROZEN_COLUMNS, ensure_ascii=False),
             1000,
             DEFAULT_FORMULA_NOTE,
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1116,16 +1151,19 @@ class Repository:
                 "store": store,
                 "raw_columns": RAW_COLUMNS,
                 "summary_columns": SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS,
-                "frozen_columns": SUMMARY_COLUMNS[:3],
+                "frozen_columns": DEFAULT_FROZEN_COLUMNS,
                 "page_size": 1000,
                 "formula_note": DEFAULT_FORMULA_NOTE,
             }
         page_size = row["page_size"] if "page_size" in row.keys() else 1000
+        raw_columns = normalized_columns(SYNTHETIC_RAW_COLUMNS + self._loads_columns(row["raw_columns"], RAW_COLUMNS))
+        summary_columns = normalized_columns(self._loads_columns(row["summary_columns"], SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS))
+        frozen_columns = normalized_columns(self._loads_columns(row["frozen_columns"], DEFAULT_FROZEN_COLUMNS))
         return {
             "store": store,
-            "raw_columns": self._loads_columns(row["raw_columns"], RAW_COLUMNS),
-            "summary_columns": self._loads_columns(row["summary_columns"], SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS),
-            "frozen_columns": self._loads_columns(row["frozen_columns"], SUMMARY_COLUMNS[:3]),
+            "raw_columns": raw_columns,
+            "summary_columns": summary_columns,
+            "frozen_columns": [col for col in frozen_columns if col in summary_columns] or DEFAULT_FROZEN_COLUMNS,
             "page_size": max(100, int(page_size or 1000)),
             "formula_note": row["formula_note"] or DEFAULT_FORMULA_NOTE,
         }
@@ -1133,9 +1171,9 @@ class Repository:
     def _loads_columns(self, text, fallback):
         try:
             values = json.loads(text or "[]")
-            return [str(v).strip() for v in values if str(v).strip()] or list(fallback)
+            return normalized_columns(values, fallback)
         except Exception:
-            return list(fallback)
+            return normalized_columns(fallback)
 
     def save_store_config(self, store, raw_columns, summary_columns, formula_note, frozen_columns=None, page_size=1000):
         """保存单店铺参数配置，包括字段、冻结栏、计算口径和分页行数。"""
@@ -1144,7 +1182,10 @@ class Repository:
             self.use_store(store)
         self.ensure_store_config_columns()
         self.ensure_store_config(store)
-        frozen_columns = frozen_columns or summary_columns[:2]
+        raw_columns = normalized_columns(raw_columns, RAW_COLUMNS)
+        summary_columns = normalized_columns(summary_columns, SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS)
+        frozen_columns = normalized_columns(frozen_columns or DEFAULT_FROZEN_COLUMNS)
+        frozen_columns = [col for col in frozen_columns if col in summary_columns] or summary_columns[:3]
         page_size = max(100, int(page_size or 1000))
         self.conn.execute("""
             UPDATE store_configs
@@ -1166,10 +1207,10 @@ class Repository:
             return
         self.use_store(store)
         config = self.store_config(store)
-        columns = list(config["raw_columns"])
-        changed = False
+        columns = normalized_columns(SYNTHETIC_RAW_COLUMNS + list(config["raw_columns"]))
+        changed = columns != list(config["raw_columns"])
         for header in headers:
-            header = str(header or "").strip()
+            header = normalize_config_column(header)
             if header and header not in columns:
                 columns.append(header)
                 changed = True
@@ -1611,6 +1652,7 @@ class Repository:
                 payload = {}
             if not payload:
                 payload = {col: row[col] if col in row.keys() else "" for col in RAW_COLUMNS}
+            payload = enrich_raw_payload(payload, row["store"], row["report_type"], row["month_label"], row["month_sort"])
             for key in payload.keys():
                 if key not in columns:
                     columns.append(key)
@@ -1666,6 +1708,7 @@ class Repository:
                 payload = json.loads(row["raw_payload"] or "{}")
             except Exception:
                 payload = {}
+            payload = enrich_raw_payload(payload, row["store"], row["report_type"], row["month_label"], row["month_sort"])
             payloads.append((row, payload))
         return payloads
 
