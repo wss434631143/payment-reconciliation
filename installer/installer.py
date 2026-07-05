@@ -61,6 +61,34 @@ def create_shortcut(shortcut_path, target_path, icon_path, arguments=""):
     run_powershell(ps)
 
 
+def ps_quote(value):
+    return str(value).replace("'", "''")
+
+
+def stop_installed_processes(install_dir):
+    """关闭安装目录中的所有旧版程序进程，避免安装/卸载时文件被占用。"""
+    escaped_dir = ps_quote(Path(install_dir))
+    script = f"""
+    $target = '{escaped_dir}'
+    Get-Process | Where-Object {{ $_.Path -and $_.Path.StartsWith($target, [System.StringComparison]::OrdinalIgnoreCase) }} | Stop-Process -Force
+    """
+    try:
+        run_powershell(script)
+    except Exception:
+        subprocess.run(["taskkill", "/F", "/IM", "财务第三方支付核对-Qt版*.exe"], creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def cleanup_previous_install_files(install_dir):
+    """删除旧安装包留下的主程序、卸载脚本和图标，保留用户业务数据。"""
+    for pattern in ("财务第三方支付核对-Qt版*.exe", "uninstall.*", "app_icon.ico"):
+        for file in Path(install_dir).glob(pattern):
+            if file.is_file():
+                try:
+                    file.unlink()
+                except OSError:
+                    pass
+
+
 def write_uninstaller(install_dir):
     """写入可被 Windows 程序和功能直接调用的卸载脚本。"""
     uninstall_cmd = install_dir / "uninstall.cmd"
@@ -72,6 +100,8 @@ def write_uninstaller(install_dir):
 setlocal
 chcp 65001 >nul
 taskkill /IM "{APP_EXE_NAME}" /F >nul 2>nul
+taskkill /IM "财务第三方支付核对-Qt版*.exe" /F >nul 2>nul
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "$target='{ps_quote(install_dir)}'; Get-Process | Where-Object {{ $_.Path -and $_.Path.StartsWith($target, [System.StringComparison]::OrdinalIgnoreCase) }} | Stop-Process -Force" >nul 2>nul
 del /F /Q "{desktop_link}" >nul 2>nul
 rmdir /S /Q "{menu_dir}" >nul 2>nul
 reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PaymentReconciliationQt" /f >nul 2>nul
@@ -81,6 +111,8 @@ set "INSTALL_DIR={install_dir}"
   echo @echo off
   echo timeout /t 2 /nobreak ^>nul
   echo rmdir /s /q "%%INSTALL_DIR%%"
+  echo timeout /t 3 /nobreak ^>nul
+  echo if exist "%%INSTALL_DIR%%" rmdir /s /q "%%INSTALL_DIR%%"
   echo del /f /q "%%~f0" ^>nul 2^>nul
 ) > "%%CLEANUP%%"
 start "" /min cmd /c "%%CLEANUP%%"
@@ -108,6 +140,8 @@ def register_uninstall(install_dir, app_exe, uninstall_cmd):
 def install(install_dir, create_desktop=True, create_start_menu=True):
     install_dir = Path(install_dir).expanduser()
     install_dir.mkdir(parents=True, exist_ok=True)
+    stop_installed_processes(install_dir)
+    cleanup_previous_install_files(install_dir)
 
     source_exe = resource_path(f"payload/{APP_EXE_NAME}")
     source_icon = resource_path("payload/app_icon.ico")
