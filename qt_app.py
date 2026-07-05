@@ -73,6 +73,7 @@ from payment_recon_qt import (
 
 
 APP_TITLE = "财务第三方支付核对 - Qt版"
+APP_VERSION = "1.0.4"
 
 
 # 界面统一显示“年月”，但底层旧配置仍可能叫“月份”。
@@ -1335,7 +1336,7 @@ class MainWindow(QMainWindow):
         self.app_settings = self.load_app_settings()
         self.tray_icon = None
         self.force_quit = False
-        self.setWindowTitle(APP_TITLE)
+        self.setWindowTitle(f"{APP_TITLE} v{APP_VERSION}")
         icon_path = resource_path("assets/app_icon.ico")
         app_icon = QIcon(str(icon_path)) if icon_path.exists() else QIcon(str(sys.executable))
         if not app_icon.isNull():
@@ -1361,8 +1362,8 @@ class MainWindow(QMainWindow):
             ("店铺配置", self.manage_stores),
             ("参数配置", self.configure_current_store),
             ("录入余额", self.edit_balance),
-            ("调整", self.add_adjustment),
-            ("差异调整", self.show_difference),
+            ("差异调整", self.add_adjustment),
+            ("差异明细", self.show_difference),
             ("导出", self.export_summary),
             ("备份及还原", self.open_backup_restore),
             ("设置", self.open_global_settings),
@@ -1378,7 +1379,7 @@ class MainWindow(QMainWindow):
 
         title = QLabel("财务第三方支付核对")
         title.setObjectName("titleLabel")
-        subtitle = QLabel("当前视图按店铺和报表类型隔离数据：先选择店铺、报表类型，再导入、查询、录入余额和调整差异。参数配置可按店铺单独维护。")
+        subtitle = QLabel("当前视图按店铺和报表类型隔离数据：先选择店铺、报表类型，再导入、查询、录入余额和差异调整。参数配置可按店铺单独维护。")
         subtitle.setObjectName("formulaLabel")
         subtitle.setWordWrap(True)
         root_layout.addWidget(title)
@@ -1423,13 +1424,15 @@ class MainWindow(QMainWindow):
         summary_title.setObjectName("sectionTitle")
         summary_layout.addWidget(summary_title)
         self.summary_splitter = QSplitter(Qt.Horizontal)
-        self.summary_fixed = QTableWidget(0, 2)
-        self.summary_scroll = QTableWidget(0, len(SUMMARY_COLUMNS[2:]) + len(SUMMARY_EXTRA_COLUMNS))
-        self.summary_fixed.setHorizontalHeaderLabels([display_header(header) for header in SUMMARY_COLUMNS[:2]])
-        self.summary_scroll.setHorizontalHeaderLabels([display_header(header) for header in SUMMARY_COLUMNS[2:] + SUMMARY_EXTRA_COLUMNS])
+        default_frozen_headers = [header for header in ("店铺", "报表类型", "年月") if header in SUMMARY_COLUMNS]
+        default_scroll_headers = [header for header in SUMMARY_COLUMNS + SUMMARY_EXTRA_COLUMNS if header not in default_frozen_headers]
+        self.summary_fixed = QTableWidget(0, len(default_frozen_headers))
+        self.summary_scroll = QTableWidget(0, len(default_scroll_headers))
+        self.summary_fixed.setHorizontalHeaderLabels([display_header(header) for header in default_frozen_headers])
+        self.summary_scroll.setHorizontalHeaderLabels([display_header(header) for header in default_scroll_headers])
         self.configure_table(self.summary_fixed)
         self.configure_table(self.summary_scroll)
-        self.summary_fixed.setMinimumWidth(120)
+        self.summary_fixed.setMinimumWidth(0)
         self.summary_scroll.setMinimumWidth(160)
         self.summary_fixed.verticalScrollBar().valueChanged.connect(self.summary_scroll.verticalScrollBar().setValue)
         self.summary_scroll.verticalScrollBar().valueChanged.connect(self.summary_fixed.verticalScrollBar().setValue)
@@ -1441,7 +1444,7 @@ class MainWindow(QMainWindow):
         self.summary_splitter.addWidget(self.summary_scroll)
         self.summary_splitter.setStretchFactor(0, 0)
         self.summary_splitter.setStretchFactor(1, 1)
-        self.summary_splitter.setSizes([220, 1100])
+        self.summary_splitter.setSizes([300, 1020])
         summary_layout.addWidget(self.summary_splitter, 1)
 
         detail_widget = QWidget()
@@ -1704,9 +1707,19 @@ class MainWindow(QMainWindow):
         self.month_filter.clear()
         self.refresh_all()
 
+    def reset_summary_headers(self):
+        headers = self.current_summary_columns()
+        frozen_headers = self.current_frozen_columns(headers)
+        scroll_headers = [header for header in headers if header not in frozen_headers]
+        self.summary_fixed.setColumnCount(len(frozen_headers))
+        self.summary_scroll.setColumnCount(len(scroll_headers))
+        self.summary_fixed.setHorizontalHeaderLabels([display_header(header) for header in frozen_headers])
+        self.summary_scroll.setHorizontalHeaderLabels([display_header(header) for header in scroll_headers])
+
     def clear_loaded_data(self, message=""):
         self.summary_rows = []
         self.current_summary_key = None
+        self.reset_summary_headers()
         self.summary_fixed.setRowCount(0)
         self.summary_scroll.setRowCount(0)
         self.detail_table.setRowCount(0)
@@ -1827,12 +1840,12 @@ class MainWindow(QMainWindow):
                     item.setBackground(bg)
                     item.setForeground(QColor("#111827"))
                 self.summary_scroll.setItem(row_idx, col, item)
-        self.auto_fit(self.summary_fixed, max_width=150)
+        self.auto_fit(self.summary_fixed, max_width=180)
         self.auto_fit(self.summary_scroll, max_width=260)
         fixed_width = sum(self.summary_fixed.columnWidth(col) for col in range(self.summary_fixed.columnCount())) + 24
         current_sizes = self.summary_splitter.sizes() if hasattr(self, "summary_splitter") else []
         if not current_sizes or sum(current_sizes) == 0:
-            self.summary_splitter.setSizes([max(160, min(fixed_width, 420)), 1000])
+            self.summary_splitter.setSizes([min(fixed_width, 520), 1000])
         type_text = report_type or "全部"
         db_path = Path(self.repo.store_db_path(store))
         self.set_status(
@@ -1858,11 +1871,14 @@ class MainWindow(QMainWindow):
         headers = headers or self.current_summary_columns()
         if store:
             config = self.repo.store_config(store)
-            frozen = [col for col in config.get("frozen_columns", headers[:2]) if col in headers]
+            configured = config.get("frozen_columns") or ["店铺", "报表类型", "年月"]
+            frozen = [col for col in configured if col in headers]
+            if "年月" in headers and "年月" not in frozen:
+                insert_at = 2 if "报表类型" in frozen else len(frozen)
+                frozen.insert(insert_at, "年月")
         else:
-            frozen = headers[:2]
-        return frozen or headers[:2]
-
+            frozen = [col for col in ("店铺", "报表类型", "年月") if col in headers]
+        return frozen or headers[:3]
     def summary_value(self, row, header):
         values = {
             "店铺": row["store"],
@@ -2410,7 +2426,7 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
-    app.setApplicationName(APP_TITLE)
+    app.setApplicationName(f"{APP_TITLE} v{APP_VERSION}")
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

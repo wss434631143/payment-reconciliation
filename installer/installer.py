@@ -62,38 +62,48 @@ def create_shortcut(shortcut_path, target_path, icon_path, arguments=""):
 
 
 def write_uninstaller(install_dir):
-    uninstall_ps1 = install_dir / "uninstall.ps1"
+    """写入可被 Windows 程序和功能直接调用的卸载脚本。"""
+    uninstall_cmd = install_dir / "uninstall.cmd"
     desktop_link = desktop_dir() / f"{APP_NAME}.lnk"
     menu_dir = start_menu_dir()
+    cleanup_cmd = Path(os.environ.get("TEMP", str(Path.home()))) / "PaymentReconciliationQt_cleanup.cmd"
     script = f"""
-    $ErrorActionPreference = 'SilentlyContinue'
-    Remove-Item -LiteralPath '{str(desktop_link).replace("'", "''")}' -Force
-    Remove-Item -LiteralPath '{str(menu_dir).replace("'", "''")}' -Recurse -Force
-    Remove-Item -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PaymentReconciliationQt' -Recurse -Force
-    Start-Process -WindowStyle Hidden -FilePath cmd.exe -ArgumentList '/c timeout /t 1 /nobreak > nul & rmdir /s /q "{install_dir}"'
-    """
-    uninstall_ps1.write_text(textwrap.dedent(script).strip(), encoding="utf-8")
-    return uninstall_ps1
+@echo off
+setlocal
+chcp 65001 >nul
+taskkill /IM "{APP_EXE_NAME}" /F >nul 2>nul
+del /F /Q "{desktop_link}" >nul 2>nul
+rmdir /S /Q "{menu_dir}" >nul 2>nul
+reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\PaymentReconciliationQt" /f >nul 2>nul
+set "CLEANUP={cleanup_cmd}"
+set "INSTALL_DIR={install_dir}"
+(
+  echo @echo off
+  echo timeout /t 2 /nobreak ^>nul
+  echo rmdir /s /q "%%INSTALL_DIR%%"
+  echo del /f /q "%%~f0" ^>nul 2^>nul
+) > "%%CLEANUP%%"
+start "" /min cmd /c "%%CLEANUP%%"
+exit /b 0
+"""
+    uninstall_cmd.write_text(textwrap.dedent(script).strip() + "\n", encoding="utf-8-sig")
+    return uninstall_cmd
 
-
-def register_uninstall(install_dir, app_exe, uninstall_ps1):
+def register_uninstall(install_dir, app_exe, uninstall_cmd):
+    """注册当前用户级卸载入口，供 Windows 程序和功能识别。"""
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PaymentReconciliationQt"
+    cmd_exe = Path(os.environ.get("SystemRoot", r"C:\\Windows")) / "System32" / "cmd.exe"
+    uninstall_string = f'"{cmd_exe}" /c ""{uninstall_cmd}""'
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key_path) as key:
         winreg.SetValueEx(key, "DisplayName", 0, winreg.REG_SZ, APP_NAME)
         winreg.SetValueEx(key, "DisplayVersion", 0, winreg.REG_SZ, APP_VERSION)
         winreg.SetValueEx(key, "Publisher", 0, winreg.REG_SZ, PUBLISHER)
         winreg.SetValueEx(key, "InstallLocation", 0, winreg.REG_SZ, str(install_dir))
-        winreg.SetValueEx(key, "DisplayIcon", 0, winreg.REG_SZ, str(app_exe))
-        winreg.SetValueEx(
-            key,
-            "UninstallString",
-            0,
-            winreg.REG_SZ,
-            f'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "{uninstall_ps1}"',
-        )
+        winreg.SetValueEx(key, "DisplayIcon", 0, winreg.REG_SZ, f"{app_exe},0")
+        winreg.SetValueEx(key, "UninstallString", 0, winreg.REG_SZ, uninstall_string)
+        winreg.SetValueEx(key, "QuietUninstallString", 0, winreg.REG_SZ, uninstall_string)
         winreg.SetValueEx(key, "NoModify", 0, winreg.REG_DWORD, 1)
         winreg.SetValueEx(key, "NoRepair", 0, winreg.REG_DWORD, 1)
-
 
 def install(install_dir, create_desktop=True, create_start_menu=True):
     install_dir = Path(install_dir).expanduser()
@@ -109,7 +119,7 @@ def install(install_dir, create_desktop=True, create_start_menu=True):
     shutil.copy2(source_exe, app_exe)
     shutil.copy2(source_icon, icon_path)
 
-    uninstall_ps1 = write_uninstaller(install_dir)
+    uninstall_cmd = write_uninstaller(install_dir)
     if create_desktop:
         create_shortcut(desktop_dir() / f"{APP_NAME}.lnk", app_exe, icon_path)
 
@@ -118,11 +128,11 @@ def install(install_dir, create_desktop=True, create_start_menu=True):
         create_shortcut(menu_dir / f"{APP_NAME}.lnk", app_exe, icon_path)
         create_shortcut(
             menu_dir / "卸载.lnk",
-            Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe",
+            Path(os.environ.get("SystemRoot", r"C:\\Windows")) / "System32" / "cmd.exe",
             icon_path,
-            f'-NoProfile -ExecutionPolicy Bypass -File "{uninstall_ps1}"',
+            f'/c ""{uninstall_cmd}""',
         )
-    register_uninstall(install_dir, app_exe, uninstall_ps1)
+    register_uninstall(install_dir, app_exe, uninstall_cmd)
     return app_exe
 
 
