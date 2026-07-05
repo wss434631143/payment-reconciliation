@@ -1,4 +1,10 @@
 # -*- coding: utf-8 -*-
+"""Qt 主界面模块。
+
+本文件负责 Windows 桌面端交互：工具栏、弹窗、汇总表、明细表、
+筛选分页、导出和全局设置。数据库读写、导入解析、金额计算统一放在
+payment_recon_qt.Repository 中，避免界面代码直接拼业务 SQL。
+"""
 import json
 import os
 import sys
@@ -67,6 +73,8 @@ from payment_recon_qt import (
 APP_TITLE = "财务第三方支付核对 - Qt版"
 
 
+# 界面统一显示“年月”，但底层旧配置仍可能叫“月份”。
+# 这里集中维护显示名和数据名的互相转换。
 DISPLAY_HEADER_MAP = {
     "月份": "年月",
     "月份排序": "年月排序",
@@ -79,14 +87,17 @@ DATA_HEADER_MAP = {display: data for data, display in DISPLAY_HEADER_MAP.items()
 
 
 def display_header(name):
+    """把底层字段名转换为界面展示名。"""
     return DISPLAY_HEADER_MAP.get(name, name)
 
 
 def data_header(name):
+    """把界面展示名转换为底层字段名。"""
     return DATA_HEADER_MAP.get(name, name)
 
 
 def localize_buttons(buttons, ok_text="确定", cancel_text="退出", close_text="关闭"):
+    """统一弹窗右下角按钮文案，避免默认 OK/Cancel 出现在中文界面。"""
     ok_button = buttons.button(QDialogButtonBox.Ok)
     if ok_button:
         ok_button.setText(ok_text)
@@ -99,11 +110,13 @@ def localize_buttons(buttons, ok_text="确定", cancel_text="退出", close_text
 
 
 def resource_path(name):
+    """兼容源码运行和 PyInstaller onefile 运行时的资源路径。"""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base / name
 
 
 def table_item(value, align=Qt.AlignCenter):
+    """创建只读表格单元格，统一对齐和编辑状态。"""
     item = QTableWidgetItem(str(value))
     item.setTextAlignment(align)
     item.setFlags(item.flags() ^ Qt.ItemIsEditable)
@@ -111,6 +124,8 @@ def table_item(value, align=Qt.AlignCenter):
 
 
 class BalanceDialog(QDialog):
+    """录入或修改期初金额、店铺期末余额的弹窗。"""
+
     def __init__(self, parent, initial):
         super().__init__(parent)
         self.setWindowTitle("录入/修改余额")
@@ -162,6 +177,8 @@ class BalanceDialog(QDialog):
 
 
 class AdjustmentDialog(QDialog):
+    """新增手工调整记录，并说明调整影响哪一个汇总字段。"""
+
     def __init__(self, parent, row):
         super().__init__(parent)
         self.setWindowTitle("新增差异调整")
@@ -206,6 +223,8 @@ class AdjustmentDialog(QDialog):
 
 
 class TransactionDialog(QDialog):
+    """编辑单条明细流水的常用字段。"""
+
     FIELDS = ["店铺", "月份显示", "月份排序(YYYY-MM)", "动账时间", "动账方向", "动账账户", "动账金额", "动账摘要", "业务类型"]
 
     def __init__(self, parent, initial):
@@ -239,6 +258,8 @@ class TransactionDialog(QDialog):
 
 
 class MonthSelectDialog(QDialog):
+    """选择首页查询年月区间的弹窗。"""
+
     def __init__(self, parent, months, selected):
         super().__init__(parent)
         self.setWindowTitle("选择年月区间")
@@ -318,6 +339,8 @@ class MonthSelectDialog(QDialog):
 
 
 class ImportOptionsDialog(QDialog):
+    """导入流水前的一站式设置弹窗：店铺、报表类型、归属年月。"""
+
     def __init__(self, parent, stores, current_store="", initial_month=None):
         super().__init__(parent)
         self.setWindowTitle("导入流水设置")
@@ -372,6 +395,8 @@ class ImportOptionsDialog(QDialog):
 
 
 class GlobalSettingsDialog(QDialog):
+    """全局设置弹窗，例如开机自启动和关闭到托盘。"""
+
     def __init__(self, parent, settings):
         super().__init__(parent)
         self.setWindowTitle("全局设置")
@@ -401,6 +426,8 @@ class GlobalSettingsDialog(QDialog):
 
 
 class BackupRestoreDialog(QDialog):
+    """备份和还原店铺数据库、主配置、全局设置的弹窗。"""
+
     def __init__(self, parent, repo):
         super().__init__(parent)
         self.repo = repo
@@ -564,6 +591,8 @@ class BackupRestoreDialog(QDialog):
 
 
 class StoreDialog(QDialog):
+    """店铺配置弹窗，支持直接编辑店铺名称、备注和状态。"""
+
     def __init__(self, parent, repo):
         super().__init__(parent)
         self.repo = repo
@@ -642,6 +671,8 @@ class StoreDialog(QDialog):
 
 
 class FieldListEditor(QWidget):
+    """参数配置中的字段列表编辑器，支持增删、排序和冻结/活动区互移。"""
+
     def __init__(self, values, title):
         super().__init__()
         self.table = QTableWidget(0, 1)
@@ -747,6 +778,8 @@ class FieldListEditor(QWidget):
 
 
 class FormulaEditor(QWidget):
+    """参数配置中的计算口径编辑器。"""
+
     def __init__(self, formula_note):
         super().__init__()
         self.table = QTableWidget(0, 2)
@@ -793,6 +826,8 @@ class FormulaEditor(QWidget):
 
 
 class StoreConfigDialog(QDialog):
+    """单店铺参数配置弹窗：原始字段、汇总字段、计算口径和分页行数。"""
+
     def __init__(self, parent, repo, store):
         super().__init__(parent)
         self.repo = repo
@@ -875,6 +910,8 @@ class StoreConfigDialog(QDialog):
 
 
 class DifferenceDialog(QDialog):
+    """差异明细弹窗，集中展示核对摘要、动账分组和手工调整记录。"""
+
     def __init__(self, parent, repo, row):
         super().__init__(parent)
         self.setWindowTitle(f"差异明细 - {row['store']} {row['month_label']}")
@@ -974,8 +1011,16 @@ class DifferenceDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
+    """应用主窗口。
+
+    主窗口负责把店铺、报表类型、年月区间、汇总表和明细表串起来；
+    所有数据查询都通过 Repository 完成。大数据场景下只渲染当前页明细，
+    并把筛选条件暂存到用户点击“开始筛选”后再执行。
+    """
+
     def __init__(self):
         super().__init__()
+        # Repository 是全应用唯一的数据入口，主窗口只保存当前 UI 状态。
         self.repo = Repository(DB_PATH)
         self.summary_rows = []
         self.current_summary_key = None
@@ -1004,6 +1049,8 @@ class MainWindow(QMainWindow):
         self.clear_loaded_data("请选择店铺和年月后点击“查询”。")
 
     def build_ui(self):
+        """搭建首页布局和工具栏。"""
+
         toolbar = QToolBar("主操作")
         toolbar.setMovable(False)
         self.addToolBar(toolbar)
@@ -1209,6 +1256,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(root)
 
     def configure_table(self, table):
+        """统一表格样式，关闭自动换行以降低大数据渲染成本。"""
+
         table.setAlternatingRowColors(True)
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.setSelectionMode(QTableWidget.SingleSelection)
@@ -1218,6 +1267,8 @@ class MainWindow(QMainWindow):
         table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
 
     def set_status(self, text, tooltip=None):
+        """设置底部状态提示，长文本在界面上省略、完整内容放到 tooltip。"""
+
         text = str(text or "")
         tooltip = text if tooltip is None else str(tooltip or "")
         metrics = QFontMetrics(self.status.font())
@@ -1442,6 +1493,8 @@ class MainWindow(QMainWindow):
             self.refresh_details(None)
 
     def refresh_summary(self):
+        """按当前店铺、报表类型、年月区间刷新汇总表。"""
+
         store = self.current_store()
         report_type = self.current_report_type_filter()
         self.detail_filter_value_cache.clear()
@@ -1574,6 +1627,8 @@ class MainWindow(QMainWindow):
         return None
 
     def refresh_details(self, row, refresh_filter_values=False):
+        """按选中的汇总行分页刷新明细流水。"""
+
         self.detail_table.setUpdatesEnabled(False)
         self.detail_table.setSortingEnabled(False)
         self.detail_table.setRowCount(0)
@@ -1695,6 +1750,8 @@ class MainWindow(QMainWindow):
             self.detail_table.setColumnWidth(col, width)
 
     def update_detail_filter_labels(self):
+        """刷新明细筛选条件说明，条件过多时允许换行显示。"""
+
         applied = "；".join(f"{c} = {v}" for c, v in self.detail_filters) or "无"
         pending = "；".join(f"{c} = {v}" for c, v in self.pending_detail_filters) or "无"
         self.detail_active_filters_label.setText(f"已应用：{applied}\n待应用：{pending}")
@@ -1720,6 +1777,8 @@ class MainWindow(QMainWindow):
             self.refresh_details(row, refresh_filter_values=False)
 
     def refresh_detail_filter_values(self):
+        """加载当前筛选字段的可选值，并使用缓存减少大表重复 distinct 查询。"""
+
         row = self.selected_summary()
         column = self.detail_filter_column_combo.currentText().strip() if self.detail_filter_column_combo.count() else ""
         current = self.detail_filter_value_combo.currentText() if self.detail_filter_value_combo.count() else ""
@@ -1811,6 +1870,8 @@ class MainWindow(QMainWindow):
             self.clear_loaded_data("参数配置已保存。点击“查询”重新加载当前店铺数据。")
 
     def import_excel(self):
+        """导入 Excel/CSV 流水文件，并在状态栏显示导入进度和最终行数。"""
+
         stores = [row["name"] for row in self.repo.configured_stores()]
         if not stores:
             if QMessageBox.question(self, "需要配置店铺", "还没有配置店铺。是否现在添加店铺？") == QMessageBox.Yes:
@@ -1969,6 +2030,8 @@ class MainWindow(QMainWindow):
         return text
 
     def export_summary(self):
+        """导出汇总表和原始表格，原始表格按分页配置分批写入 XLSX。"""
+
         store = self.current_store()
         month_text = self.month_filter.text().strip() or "全部年月"
         type_text = self.current_report_type_filter() or "全部类型"

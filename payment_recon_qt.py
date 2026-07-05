@@ -1,4 +1,10 @@
 # -*- coding: utf-8 -*-
+"""财务核对核心业务模块。
+
+本文件负责 SQLite 数据库、Excel/CSV 导入、字段映射、金额计算、
+汇总查询、明细分页、差异分组和备份还原。Qt 主界面只调用 Repository，
+不直接操作数据库，从而让业务逻辑可以独立测试和复用。
+"""
 import csv
 import hashlib
 import json
@@ -31,11 +37,13 @@ DB_PATH = DATA_DIR / "reconciliation.sqlite3"
 
 REPORT_TYPES = ["已结算", "未结算"]
 
+# 默认汇总字段。每个店铺后续可在参数配置中单独调整。
 SUMMARY_COLUMNS = [
     "店铺", "报表类型", "月份", "订单实付应结", "平台补贴", "商家补贴", "结算运费", "订单退款",
     "收入净额合计", "已结算佣金", "技术服务费", "支出金额", "结算金额", "提现金额", "期初金额", "结算期末余额",
 ]
 
+# 默认原始流水字段。导入时会根据实际表头补充每个店铺自己的字段配置。
 RAW_COLUMNS = [
     "店铺", "月份", "动账时间", "动账流水号", "动账方向", "动账账户", "动账金额",
     "动账摘要", "业务类型", "主订单编号", "子订单编号", "售后单号", "下单时间",
@@ -43,6 +51,7 @@ RAW_COLUMNS = [
     "结算运费", "订单退款", "佣金", "技术服务费",
 ]
 
+# 手工调整可以影响的汇总字段；“备查”只记录说明，不改变汇总金额。
 ADJUSTABLE_COLUMNS = [
     "备查（不影响汇总）", "订单实付应结", "平台补贴", "商家补贴", "结算运费", "订单退款",
     "已结算佣金", "技术服务费", "提现金额", "期初金额",
@@ -78,6 +87,8 @@ LEADING_TEXT_MARKS = "'’＇`"
 
 
 def clean_cell_text(value):
+    """清理 Excel/CSV 单元格文本，去掉订单号前常见的文本标记。"""
+
     if value is None:
         return ""
     if isinstance(value, datetime):
@@ -87,14 +98,20 @@ def clean_cell_text(value):
 
 
 def sql_literal(value):
+    """把文本安全转换成 SQL 字面量，主要用于生成清洗表达式。"""
+
     return "'" + str(value).replace("'", "''") + "'"
 
 
 def clean_sql_expr(expr):
+    """生成 SQLite 表达式，查询时清理前导文本标记。"""
+
     return f"LTRIM(CAST({expr} AS TEXT), {sql_literal(LEADING_TEXT_MARKS)})"
 
 
 def money(value) -> Decimal:
+    """把输入值转换为 Decimal 金额，并统一保留两位小数。"""
+
     if value is None or value == "":
         return Decimal("0")
     try:
@@ -104,14 +121,20 @@ def money(value) -> Decimal:
 
 
 def money_text(value) -> str:
+    """把金额格式化为带千分位的显示文本。"""
+
     return f"{money(value):,.2f}"
 
 
 def db_float(value) -> float:
+    """把金额转换为 SQLite 可存储的 float。"""
+
     return float(money(value))
 
 
 def normalize_header(value) -> str:
+    """标准化表头，便于匹配不同平台的字段别名。"""
+
     return clean_cell_text(value).replace("\n", "").replace("\r", "")
 
 
@@ -146,6 +169,8 @@ AMOUNT_ALIASES = {
 
 
 def difference_reason(row) -> str:
+    """根据余额核对结果生成一段可读的差异说明。"""
+
     if row["account_ending"] is None:
         return "未录入店铺期末余额"
     if row["difference"] == Decimal("0.00"):
@@ -155,6 +180,8 @@ def difference_reason(row) -> str:
 
 
 def parse_month_sort(label, transaction_time=None) -> str:
+    """把各种年月显示格式统一成 YYYY-MM 排序值。"""
+
     label = str(label or "").strip()
     digits = "".join(ch for ch in label if ch.isdigit())
     if "月" in label and digits:
@@ -179,6 +206,8 @@ def parse_month_sort(label, transaction_time=None) -> str:
 
 
 def normalize_month_token(value) -> str:
+    """把用户输入的年月片段统一成 YYYY-MM。"""
+
     text = str(value or "").strip()
     if not text:
         return ""
@@ -191,6 +220,8 @@ def normalize_month_token(value) -> str:
 
 
 def parse_month_filter(value):
+    """解析首页年月筛选，支持逗号分隔和连续年月区间。"""
+
     text = str(value or "").strip()
     if not text:
         return []
@@ -209,6 +240,8 @@ def parse_month_filter(value):
 
 
 def month_range(start, end):
+    """生成两个年月之间的连续月份列表。"""
+
     start = normalize_month_token(start)
     end = normalize_month_token(end)
     if not start or not end:
@@ -227,6 +260,8 @@ def month_range(start, end):
 
 
 def json_default(value):
+    """把日期和 Decimal 转成 JSON 可序列化的值。"""
+
     if isinstance(value, datetime):
         return value.strftime("%Y-%m-%d %H:%M:%S")
     if isinstance(value, Decimal):
@@ -235,6 +270,8 @@ def json_default(value):
 
 
 def parse_formula_lines(text):
+    """解析店铺自定义计算口径，把“字段=表达式”拆成可执行规则。"""
+
     formulas = []
     normalized = str(text or "").replace("；", "\n").replace(";", "\n")
     for line in normalized.splitlines():
@@ -250,6 +287,8 @@ def parse_formula_lines(text):
 
 
 def eval_money_formula(expr, values):
+    """在受控变量范围内计算金额公式。"""
+
     names = sorted(FIELD_KEYS.keys(), key=len, reverse=True)
     local_vars = {}
     safe_expr = str(expr)
@@ -265,12 +304,21 @@ def eval_money_formula(expr, values):
 
 @dataclass
 class ImportResult:
+    """导入结果统计，用于展示新增行数、跳过行数和导入文件名。"""
+
     imported: int
     skipped: int
     file_name: str
 
 
 class Repository:
+    """应用的数据访问层。
+
+    主库保存店铺清单和全局设置；每个店铺拥有独立 SQLite 文件保存流水、
+    余额、调整和字段配置。所有界面查询、导入、导出和备份还原都通过
+    本类完成。
+    """
+
     def __init__(self, path: Path):
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.path = Path(path)
@@ -288,6 +336,8 @@ class Repository:
         self._ensure_master_columns()
 
     def init_db(self):
+        """初始化主库、店铺目录和默认字段配置表。"""
+
         cur = self.conn.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS stores (
@@ -442,6 +492,8 @@ class Repository:
         return [dict(row) for row in self.master_conn.execute("SELECT key, value, updated_at FROM app_settings ORDER BY key").fetchall()]
 
     def backup_data(self, backup_path, store_names=None, include_settings=True):
+        """把主配置、全局设置和选中店铺数据库打包为 ZIP。"""
+
         store_names = [str(name).strip() for name in (store_names or []) if str(name).strip()]
         if store_names:
             placeholders = ",".join("?" for _ in store_names)
@@ -487,6 +539,8 @@ class Repository:
         self.initialized_store_dbs.discard(key)
 
     def restore_data(self, backup_path, store_names=None, restore_settings=True):
+        """从 ZIP 还原店铺数据库和配置，还原前会关闭相关店铺连接。"""
+
         manifest = self.inspect_backup(backup_path)
         wanted = {str(name).strip() for name in (store_names or []) if str(name).strip()}
         stores = [store for store in manifest.get("stores", []) if not wanted or store.get("name") in wanted]
@@ -666,6 +720,8 @@ class Repository:
             return False
 
     def use_store(self, store):
+        """切换当前店铺，并确保该店铺独立库已初始化。"""
+
         store = str(store or "").strip()
         if not store:
             self.conn = self.master_conn
@@ -700,6 +756,8 @@ class Repository:
                     raise
 
     def import_excel(self, path: str, selected_store: str = "", report_type: str = "已结算", selected_month: str = "", progress_callback=None) -> ImportResult:
+        """导入 Excel 流水，自动识别字段并写入当前店铺独立库。"""
+
         suffix = Path(path).suffix.lower()
         if suffix == ".csv":
             return self.import_csv(path, selected_store, report_type, selected_month, progress_callback)
@@ -828,6 +886,8 @@ class Repository:
         return ImportResult(imported=imported, skipped=skipped, file_name=Path(path).name)
 
     def import_csv(self, path: str, selected_store: str = "", report_type: str = "已结算", selected_month: str = "", progress_callback=None) -> ImportResult:
+        """导入 CSV 流水，兼容 UTF-8 BOM 和 GB18030 编码。"""
+
         if selected_store:
             self.use_store(selected_store)
         report_type = report_type if report_type in REPORT_TYPES else "已结算"
@@ -948,6 +1008,8 @@ class Repository:
         raise RuntimeError(f"CSV 编码无法识别：{last_error}")
 
     def configured_stores(self, include_inactive=False):
+        """读取已配置店铺，用于首页店铺下拉和店铺配置页。"""
+
         if include_inactive:
             rows = self.master_conn.execute("SELECT * FROM stores ORDER BY active DESC, name").fetchall()
         else:
@@ -1076,6 +1138,8 @@ class Repository:
             return list(fallback)
 
     def save_store_config(self, store, raw_columns, summary_columns, formula_note, frozen_columns=None, page_size=1000):
+        """保存单店铺参数配置，包括字段、冻结栏、计算口径和分页行数。"""
+
         if store:
             self.use_store(store)
         self.ensure_store_config_columns()
@@ -1183,6 +1247,8 @@ class Repository:
         self.conn.commit()
 
     def monthly_summaries(self, store_filter="", month_filter="", aggregate=True, report_type_filter=""):
+        """按店铺、报表类型、年月区间生成汇总行和区间合计行。"""
+
         store_filter = str(store_filter or "").strip()
         if not store_filter:
             return []
@@ -1232,6 +1298,8 @@ class Repository:
         """, params).fetchall()
 
     def _build_month_summary(self, row):
+        """把数据库聚合结果、余额和调整记录组装成单月汇总。"""
+
         report_type = row["report_type"] or "已结算"
         balance = self.balance_for(row["store"], row["month_sort"], report_type)
         adjustments_by_target = self.adjustment_totals_by_target(row["store"], row["month_sort"], report_type)
@@ -1319,6 +1387,8 @@ class Repository:
         return result
 
     def _aggregate_rows(self, rows, months):
+        """把多个月汇总为区间合计，期初取首月、期末取末月。"""
+
         result = []
         by_store = {}
         for row in rows:
@@ -1358,6 +1428,8 @@ class Repository:
         return result
 
     def apply_store_formulas(self, store, summary):
+        """应用店铺自定义计算口径，没有配置时使用默认公式。"""
+
         formulas = parse_formula_lines(self.store_config(store)["formula_note"])
         for target, expr in formulas:
             key = FIELD_KEYS[target]
@@ -1419,6 +1491,8 @@ class Repository:
         }
 
     def _detail_filter_sql(self, filters, params):
+        """把明细筛选条件转换为 SQL where 片段和参数。"""
+
         sql = ""
         column_map = self._detail_column_map()
         for column, value in filters or []:
@@ -1435,6 +1509,8 @@ class Repository:
         return sql
 
     def details(self, store, month_sort=None, months=None, sort_order="ASC", sort_column="动账时间", report_type_filter="", limit=None, offset=0, filter_column="", filter_value="", filters=None):
+        """分页读取明细流水，排序和筛选尽量下推到 SQLite。"""
+
         months = months or ([month_sort] if month_sort else [])
         if not store or not months:
             return []
@@ -1477,6 +1553,8 @@ class Repository:
         return int(row["count"] if row else 0)
 
     def detail_distinct_values(self, store, months, report_type_filter, column, filters=None, limit=500):
+        """读取筛选下拉候选值，用于 Excel 风格的精确筛选体验。"""
+
         if not store or not months:
             return []
         self.use_store(store)
@@ -1559,6 +1637,8 @@ class Repository:
         return int(row["count"] if row else 0)
 
     def raw_rows_for_export_page(self, store_filter="", month_filter="", report_type_filter="", limit=5000, offset=0):
+        """导出原始表格时按批读取，避免一次性加载大表。"""
+
         store_filter = str(store_filter or "").strip()
         if not store_filter:
             return []
@@ -1590,6 +1670,8 @@ class Repository:
         return payloads
 
     def difference_groups(self, store, month_sort=None, months=None, report_type="已结算"):
+        """按动账方向和摘要分组差异相关流水，供差异明细页展示。"""
+
         months = months or ([month_sort] if month_sort else [])
         if not store or not months:
             return [], []

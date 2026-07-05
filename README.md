@@ -55,6 +55,24 @@
 
 不同店铺的原始字段、汇总字段和计算口径可以在“参数配置”中维护。
 
+## 代码结构
+
+```text
+qt_app.py                         # PySide6 主界面：窗口、弹窗、表格、筛选、导出入口
+payment_recon_qt.py               # 核心业务：SQLite、导入解析、金额计算、汇总、明细分页、备份还原
+assets/                           # 应用图标和 README 实际界面录屏 GIF
+scripts/create_usage_gif.py       # 启动真实 Qt 程序并截图生成 README GIF
+docs/需求说明与设计方案.md        # 业务需求、技术设计、数据设计和验证方案
+skills/windows-qt-app-release/    # 可复用 Codex skill，用于后续 Windows Qt 程序开发发布
+```
+
+主要分层：
+
+- `qt_app.py` 只处理桌面端交互，不直接拼业务 SQL。
+- `payment_recon_qt.py` 中的 `Repository` 是统一数据入口，负责主库、店铺独立库、导入、查询、导出和备份还原。
+- 大数据明细采用 SQLite 分页查询，筛选条件先暂存，点击“开始筛选”后再执行。
+- 每个店铺的字段配置、冻结栏、计算口径和分页参数都保存在店铺独立库中。
+
 ## 数据存储
 
 ```text
@@ -78,7 +96,6 @@ python qt_app.py
 正式发布包包含：
 
 - `财务第三方支付核对-Qt版-v1.0.3.exe`
-- `使用说明.md`
 - `RELEASE_NOTES_v1.0.3.md`
 
 下载 exe 后可直接运行。数据默认保存在 exe 同级目录下的 `data` 文件夹中。
