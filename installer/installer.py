@@ -12,7 +12,7 @@ import textwrap
 import winreg
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
 
 
 APP_NAME = "财务第三方支付核对"
@@ -95,8 +95,8 @@ def register_uninstall(install_dir, app_exe, uninstall_ps1):
         winreg.SetValueEx(key, "NoRepair", 0, winreg.REG_DWORD, 1)
 
 
-def install():
-    install_dir = default_install_dir()
+def install(install_dir, create_desktop=True, create_start_menu=True):
+    install_dir = Path(install_dir).expanduser()
     install_dir.mkdir(parents=True, exist_ok=True)
 
     source_exe = resource_path(f"payload/{APP_EXE_NAME}")
@@ -110,16 +110,18 @@ def install():
     shutil.copy2(source_icon, icon_path)
 
     uninstall_ps1 = write_uninstaller(install_dir)
-    create_shortcut(desktop_dir() / f"{APP_NAME}.lnk", app_exe, icon_path)
+    if create_desktop:
+        create_shortcut(desktop_dir() / f"{APP_NAME}.lnk", app_exe, icon_path)
 
     menu_dir = start_menu_dir()
-    create_shortcut(menu_dir / f"{APP_NAME}.lnk", app_exe, icon_path)
-    create_shortcut(
-        menu_dir / "卸载.lnk",
-        Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe",
-        icon_path,
-        f'-NoProfile -ExecutionPolicy Bypass -File "{uninstall_ps1}"',
-    )
+    if create_start_menu:
+        create_shortcut(menu_dir / f"{APP_NAME}.lnk", app_exe, icon_path)
+        create_shortcut(
+            menu_dir / "卸载.lnk",
+            Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe",
+            icon_path,
+            f'-NoProfile -ExecutionPolicy Bypass -File "{uninstall_ps1}"',
+        )
     register_uninstall(install_dir, app_exe, uninstall_ps1)
     return app_exe
 
@@ -128,7 +130,7 @@ class InstallerWindow(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"{APP_NAME} 安装向导")
-        self.geometry("560x360")
+        self.geometry("640x420")
         self.resizable(False, False)
         try:
             self.iconbitmap(resource_path("payload/app_icon.ico"))
@@ -136,37 +138,68 @@ class InstallerWindow(tk.Tk):
             pass
 
         self.step = 0
-        self.title_label = tk.Label(self, text=f"欢迎安装 {APP_NAME}", font=("Microsoft YaHei", 18, "bold"))
-        self.body = tk.Label(self, text="", font=("Microsoft YaHei", 11), justify="left", wraplength=500)
-        self.path_label = tk.Label(self, text=f"安装位置：{default_install_dir()}", font=("Microsoft YaHei", 9), fg="#4b5563")
-        self.status = tk.Label(self, text="", font=("Microsoft YaHei", 10), fg="#2563eb")
-        self.back_btn = tk.Button(self, text="上一步", width=10, command=self.back)
-        self.next_btn = tk.Button(self, text="下一步", width=10, command=self.next)
-        self.cancel_btn = tk.Button(self, text="退出", width=10, command=self.destroy)
+        self.install_dir = tk.StringVar(value=str(default_install_dir()))
+        self.create_desktop = tk.BooleanVar(value=True)
+        self.create_start_menu = tk.BooleanVar(value=True)
 
-        self.title_label.pack(anchor="w", padx=28, pady=(28, 12))
-        self.body.pack(anchor="w", padx=30, pady=6)
-        self.path_label.pack(anchor="w", padx=30, pady=8)
-        self.status.pack(anchor="w", padx=30, pady=8)
-        btn_frame = tk.Frame(self)
-        btn_frame.pack(side="bottom", fill="x", padx=24, pady=20)
-        self.cancel_btn.pack(in_=btn_frame, side="right", padx=4)
-        self.next_btn.pack(in_=btn_frame, side="right", padx=4)
-        self.back_btn.pack(in_=btn_frame, side="right", padx=4)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+        header = tk.Frame(self, padx=28, pady=22)
+        header.grid(row=0, column=0, sticky="ew")
+        self.title_label = tk.Label(header, text=f"欢迎安装 {APP_NAME}", font=("Microsoft YaHei", 18, "bold"))
+        self.title_label.pack(anchor="w")
+        self.body = tk.Label(header, text="", font=("Microsoft YaHei", 10), justify="left", wraplength=560, fg="#374151")
+        self.body.pack(anchor="w", pady=(10, 0))
+
+        self.content = tk.Frame(self, padx=30, pady=4)
+        self.content.grid(row=1, column=0, sticky="nsew")
+        self.content.columnconfigure(1, weight=1)
+
+        self.status = tk.Label(self, text="", font=("Microsoft YaHei", 10), fg="#2563eb", anchor="w")
+        self.status.grid(row=2, column=0, sticky="ew", padx=30, pady=(0, 6))
+
+        btn_frame = tk.Frame(self, padx=24, pady=14, bg="#f3f4f6")
+        btn_frame.grid(row=3, column=0, sticky="ew")
+        self.cancel_btn = tk.Button(btn_frame, text="退出", width=10, command=self.destroy)
+        self.next_btn = tk.Button(btn_frame, text="下一步", width=10, command=self.next)
+        self.back_btn = tk.Button(btn_frame, text="上一步", width=10, command=self.back)
+        self.cancel_btn.pack(side="right", padx=(8, 0))
+        self.next_btn.pack(side="right", padx=(8, 0))
+        self.back_btn.pack(side="right")
         self.render()
 
+    def clear_content(self):
+        for child in self.content.winfo_children():
+            child.destroy()
+
     def render(self):
+        self.clear_content()
         self.back_btn.config(state=("normal" if self.step else "disabled"))
         if self.step == 0:
-            self.body.config(text="本向导将把程序安装到当前用户目录，并自动创建桌面图标和开始菜单入口。")
+            self.title_label.config(text=f"欢迎安装 {APP_NAME}")
+            self.body.config(text="本向导将引导你选择安装位置和快捷方式选项。安装后可从桌面或开始菜单启动，也可以在 Windows 应用和功能中卸载。")
             self.next_btn.config(text="下一步")
         elif self.step == 1:
-            self.body.config(text="准备开始安装。安装完成后可直接从桌面图标启动，也可以在 Windows 应用和功能中卸载。")
+            self.title_label.config(text="选择安装选项")
+            self.body.config(text="请选择安装位置，并决定是否创建桌面图标和开始菜单入口。")
             self.next_btn.config(text="开始安装")
+            tk.Label(self.content, text="安装位置", font=("Microsoft YaHei", 10)).grid(row=0, column=0, sticky="w", pady=8)
+            path_entry = tk.Entry(self.content, textvariable=self.install_dir, font=("Microsoft YaHei", 10))
+            path_entry.grid(row=0, column=1, sticky="ew", padx=(12, 8), pady=8)
+            tk.Button(self.content, text="浏览...", command=self.choose_dir, width=9).grid(row=0, column=2, sticky="e", pady=8)
+            tk.Checkbutton(self.content, text="创建桌面快捷方式", variable=self.create_desktop, font=("Microsoft YaHei", 10)).grid(row=1, column=1, sticky="w", pady=(16, 4))
+            tk.Checkbutton(self.content, text="创建开始菜单快捷方式", variable=self.create_start_menu, font=("Microsoft YaHei", 10)).grid(row=2, column=1, sticky="w", pady=4)
         else:
+            self.title_label.config(text="安装完成")
             self.body.config(text="安装已完成。桌面和开始菜单中已经创建快捷方式。")
             self.next_btn.config(text="完成")
             self.back_btn.config(state="disabled")
+
+    def choose_dir(self):
+        path = filedialog.askdirectory(title="选择安装位置", initialdir=str(Path(self.install_dir.get()).parent))
+        if path:
+            self.install_dir.set(str(Path(path) / APP_FOLDER_NAME if Path(path).name != APP_FOLDER_NAME else Path(path)))
 
     def back(self):
         self.step = max(0, self.step - 1)
@@ -182,7 +215,10 @@ class InstallerWindow(tk.Tk):
             try:
                 self.status.config(text="正在安装，请稍候...")
                 self.update_idletasks()
-                app_exe = install()
+                if not self.install_dir.get().strip():
+                    messagebox.showwarning("请选择安装位置", "安装位置不能为空。")
+                    return
+                app_exe = install(self.install_dir.get().strip(), self.create_desktop.get(), self.create_start_menu.get())
                 self.status.config(text=f"安装完成：{app_exe}")
                 self.step = 2
                 self.render()
