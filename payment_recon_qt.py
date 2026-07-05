@@ -46,11 +46,27 @@ ADJUSTABLE_COLUMNS = [
 SUMMARY_EXTRA_COLUMNS = ["店铺期末余额", "差异", "差异原因", "调整说明"]
 
 DEFAULT_FORMULA_NOTE = (
-    "收入净额合计=订单实付应结+平台补贴+商家补贴+结算运费+订单退款；"
-    "支出金额=已结算佣金+技术服务费；"
-    "结算金额=收入净额合计+支出金额；"
-    "结算期末余额=期初金额+收入净额合计+支出金额+提现金额。"
+    "收入净额合计=订单实付应结+平台补贴+商家补贴+结算运费+订单退款\n"
+    "支出金额=已结算佣金+技术服务费\n"
+    "结算金额=收入净额合计+支出金额\n"
+    "结算期末余额=期初金额+收入净额合计+支出金额+提现金额"
 )
+
+FIELD_KEYS = {
+    "订单实付应结": "paid_settlement",
+    "平台补贴": "platform_subsidy",
+    "商家补贴": "merchant_subsidy",
+    "结算运费": "freight",
+    "订单退款": "refund",
+    "收入净额合计": "income_total",
+    "已结算佣金": "commission",
+    "技术服务费": "tech_fee",
+    "支出金额": "expense_amount",
+    "结算金额": "settlement_amount",
+    "提现金额": "withdraw_amount",
+    "期初金额": "opening_balance",
+    "结算期末余额": "ending_balance",
+}
 
 
 def money(value) -> Decimal:
@@ -161,6 +177,35 @@ def json_default(value):
     if isinstance(value, Decimal):
         return str(value)
     return str(value)
+
+
+def parse_formula_lines(text):
+    formulas = []
+    normalized = str(text or "").replace("；", "\n").replace(";", "\n")
+    for line in normalized.splitlines():
+        line = line.strip().rstrip("。")
+        if not line or "=" not in line:
+            continue
+        left, right = line.split("=", 1)
+        left = left.strip()
+        right = right.strip()
+        if left in FIELD_KEYS and right:
+            formulas.append((left, right))
+    return formulas
+
+
+def eval_money_formula(expr, values):
+    names = sorted(FIELD_KEYS.keys(), key=len, reverse=True)
+    local_vars = {}
+    safe_expr = str(expr)
+    for idx, name in enumerate(names):
+        var = f"v{idx}"
+        local_vars[var] = money(values.get(FIELD_KEYS[name], 0))
+        safe_expr = safe_expr.replace(name, var)
+    allowed = set("0123456789.+-*/() _v")
+    if any(ch not in allowed for ch in safe_expr):
+        raise ValueError(f"公式包含不支持的字符：{expr}")
+    return money(eval(safe_expr, {"__builtins__": {}}, local_vars))
 
 
 @dataclass
@@ -578,7 +623,7 @@ class Repository:
         ending = opening + income_total + expense_amount + withdraw_amount
         account_ending = None if not balance or balance["account_ending_balance"] is None else money(balance["account_ending_balance"])
         diff = None if account_ending is None else ending - account_ending
-        return {
+        summary = {
             "store": row["store"], "month_label": row["month_label"], "month_sort": row["month_sort"],
             "month_sorts": [row["month_sort"]], "is_aggregate": False,
             "paid_settlement": paid_settlement, "platform_subsidy": platform_subsidy,
@@ -591,6 +636,9 @@ class Repository:
             "adjustment_notes": self.adjustment_notes(row["store"], [row["month_sort"]]),
             "ending_balance": ending, "account_ending": account_ending, "difference": diff,
         }
+        self.apply_store_formulas(row["store"], summary)
+        summary["difference"] = None if summary["account_ending"] is None else summary["ending_balance"] - summary["account_ending"]
+        return summary
 
     def _balance_only_rows(self, store_filter="", months=None):
         months = months or []
@@ -622,7 +670,7 @@ class Repository:
             settlement_amount = income_total + expense_amount
             ending = opening + income_total + expense_amount + withdraw_amount
             account_ending = None if row["account_ending_balance"] is None else money(row["account_ending_balance"])
-            result.append({
+            summary = {
                 "store": row["store"], "month_label": row["month_label"], "month_sort": row["month_sort"],
                 "month_sorts": [row["month_sort"]], "is_aggregate": False,
                 "paid_settlement": paid_settlement, "platform_subsidy": platform_subsidy, "merchant_subsidy": merchant_subsidy,
@@ -634,7 +682,10 @@ class Repository:
                 "adjustment_notes": self.adjustment_notes(row["store"], [row["month_sort"]]),
                 "ending_balance": ending, "account_ending": account_ending,
                 "difference": None if account_ending is None else ending - account_ending,
-            })
+            }
+            self.apply_store_formulas(row["store"], summary)
+            summary["difference"] = None if summary["account_ending"] is None else summary["ending_balance"] - summary["account_ending"]
+            result.append(summary)
         return result
 
     def _aggregate_rows(self, rows, months):
@@ -669,10 +720,20 @@ class Repository:
                 aggregate["opening_balance"] + aggregate["income_total"] +
                 aggregate["expense_amount"] + aggregate["withdraw_amount"]
             )
+            self.apply_store_formulas(store, aggregate)
             aggregate["difference"] = None if aggregate["account_ending"] is None else aggregate["ending_balance"] - aggregate["account_ending"]
             result.append(aggregate)
             result.extend(store_rows)
         return result
+
+    def apply_store_formulas(self, store, summary):
+        formulas = parse_formula_lines(self.store_config(store)["formula_note"])
+        for target, expr in formulas:
+            key = FIELD_KEYS[target]
+            try:
+                summary[key] = eval_money_formula(expr, summary)
+            except Exception:
+                continue
 
     def balance_for(self, store, month_sort):
         return self.conn.execute("SELECT * FROM balances WHERE store=? AND month_sort=?", (store, month_sort)).fetchone()
