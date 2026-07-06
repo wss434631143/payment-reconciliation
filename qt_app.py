@@ -17,7 +17,7 @@ LOCAL_PYSIDE = Path(__file__).resolve().parents[2] / "work" / "pyside6_pkg"
 if LOCAL_PYSIDE.exists():
     sys.path.insert(0, str(LOCAL_PYSIDE))
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtGui import QAction, QColor, QFontMetrics, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -116,6 +116,36 @@ def resource_path(name):
     """兼容源码运行和 PyInstaller onefile 运行时的资源路径。"""
     base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
     return base / name
+
+
+class SummaryLoadWorker(QObject):
+    """后台加载汇总数据，避免大店铺查询时主界面未响应。"""
+
+    progress = Signal(str, int, int)
+    finished = Signal(object, str, str, str)
+    failed = Signal(str)
+
+    def __init__(self, store, month_filter, report_type):
+        super().__init__()
+        self.store = store
+        self.month_filter = month_filter
+        self.report_type = report_type
+
+    def run(self):
+        repo = Repository(DB_PATH)
+        try:
+            rows = repo.monthly_summaries(
+                self.store,
+                self.month_filter,
+                report_type_filter=self.report_type,
+                progress_callback=self.progress.emit,
+            )
+            db_path = str(repo.store_db_path(self.store)) if self.store else str(DB_PATH)
+            self.finished.emit(rows, self.store, self.report_type, db_path)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+        finally:
+            repo.close()
 
 
 def table_item(value, align=Qt.AlignCenter):
@@ -1345,6 +1375,9 @@ class MainWindow(QMainWindow):
         self.app_settings = self.load_app_settings()
         self.tray_icon = None
         self.force_quit = False
+        self.summary_thread = None
+        self.summary_worker = None
+        self.summary_loading = False
         self.setWindowTitle(f"{APP_TITLE} v{APP_VERSION}")
         icon_path = resource_path("assets/app_icon.ico")
         app_icon = QIcon(str(icon_path)) if icon_path.exists() else QIcon(str(sys.executable))
@@ -1407,10 +1440,10 @@ class MainWindow(QMainWindow):
         self.month_filter.setMinimumWidth(120)
         self.month_filter.setPlaceholderText("按年月筛选，如 2026-06 或 202606-202607")
         month_pick_btn = QPushButton("选择年月")
-        search_btn = QPushButton("查询")
+        self.search_btn = QPushButton("查询")
         clear_btn = QPushButton("清空")
         month_pick_btn.clicked.connect(self.select_months)
-        search_btn.clicked.connect(self.refresh_all)
+        self.search_btn.clicked.connect(self.refresh_all)
         clear_btn.clicked.connect(self.clear_filters)
         filter_layout.addWidget(QLabel("店铺"))
         filter_layout.addWidget(self.store_combo, 1)
@@ -1419,7 +1452,7 @@ class MainWindow(QMainWindow):
         filter_layout.addWidget(QLabel("年月"))
         filter_layout.addWidget(self.month_filter, 1)
         filter_layout.addWidget(month_pick_btn)
-        filter_layout.addWidget(search_btn)
+        filter_layout.addWidget(self.search_btn)
         filter_layout.addWidget(clear_btn)
         root_layout.addWidget(filter_bar)
 
@@ -1638,6 +1671,10 @@ class MainWindow(QMainWindow):
             self.hide()
             self.tray_icon.showMessage(APP_TITLE, "程序已最小化到托盘。右键托盘图标可退出。", QSystemTrayIcon.Information, 1800)
             return
+        if self.summary_loading:
+            event.ignore()
+            self.set_status("正在加载汇总数据，请等待查询完成后再退出。")
+            return
         self.force_quit = True
         event.accept()
 
@@ -1805,10 +1842,52 @@ class MainWindow(QMainWindow):
         if not self.current_store():
             self.clear_loaded_data("请先在店铺配置中新增店铺。")
             return
+        if self.summary_loading:
+            self.set_status("正在加载汇总数据，请稍候...")
+            return
+        self.start_summary_query()
+
+    def set_query_controls_enabled(self, enabled):
+        """查询期间只锁定筛选控件，主窗口保持可移动和可刷新。"""
+
+        self.summary_loading = not enabled
+        for widget in (self.store_combo, self.report_type_combo, self.month_filter):
+            widget.setEnabled(enabled)
+        if hasattr(self, "search_btn"):
+            self.search_btn.setEnabled(enabled)
+            self.search_btn.setText("查询" if enabled else "加载中...")
+
+    def start_summary_query(self):
+        """在线程中加载汇总，避免 SQLite 大批量计算阻塞 UI 线程。"""
+
+        store = self.current_store()
+        report_type = self.current_report_type_filter()
+        month_filter = self.month_filter.text().strip()
+        self.detail_filter_value_cache.clear()
+        self.set_query_controls_enabled(False)
         self.set_status("正在加载汇总数据...")
-        QApplication.processEvents()
-        self.refresh_summary()
-        QApplication.processEvents()
+        self.summary_thread = QThread(self)
+        self.summary_worker = SummaryLoadWorker(store, month_filter, report_type)
+        self.summary_worker.moveToThread(self.summary_thread)
+        self.summary_thread.started.connect(self.summary_worker.run)
+        self.summary_worker.progress.connect(self.on_summary_progress)
+        self.summary_worker.finished.connect(self.on_summary_loaded)
+        self.summary_worker.failed.connect(self.on_summary_failed)
+        self.summary_worker.finished.connect(self.summary_thread.quit)
+        self.summary_worker.failed.connect(self.summary_thread.quit)
+        self.summary_thread.finished.connect(self.summary_worker.deleteLater)
+        self.summary_thread.finished.connect(self.summary_thread.deleteLater)
+        self.summary_thread.finished.connect(self.on_summary_thread_finished)
+        self.summary_thread.start()
+
+    def on_summary_progress(self, message, value, total):
+        total = max(1, int(total or 1))
+        value = max(0, int(value or 0))
+        suffix = f" ({value}/{total})" if total > 1 else ""
+        self.set_status(f"{message}{suffix}")
+
+    def on_summary_loaded(self, rows, store, report_type, db_path):
+        self.refresh_summary(loaded_rows=list(rows or []), loaded_db_path=db_path)
         if self.summary_rows:
             self.summary_fixed.selectRow(0)
             self.summary_scroll.selectRow(0)
@@ -1816,18 +1895,33 @@ class MainWindow(QMainWindow):
         else:
             self.refresh_details(None)
 
-    def refresh_summary(self):
+    def on_summary_failed(self, message):
+        self.refresh_details(None)
+        QMessageBox.critical(self, "查询失败", message)
+        self.set_status("查询失败，请查看错误信息。")
+
+    def on_summary_thread_finished(self):
+        self.summary_thread = None
+        self.summary_worker = None
+        self.set_query_controls_enabled(True)
+
+    def refresh_summary(self, loaded_rows=None, loaded_db_path=None):
         """按当前店铺、报表类型、年月区间刷新汇总表。"""
 
         store = self.current_store()
         report_type = self.current_report_type_filter()
         self.detail_filter_value_cache.clear()
-        self.summary_rows = self.repo.monthly_summaries(
-            store,
-            self.month_filter.text().strip(),
-            report_type_filter=report_type,
-            progress_callback=lambda message, value, total: self.set_status(message),
-        )
+        if loaded_rows is None:
+            self.summary_rows = self.repo.monthly_summaries(
+                store,
+                self.month_filter.text().strip(),
+                report_type_filter=report_type,
+                progress_callback=lambda message, value, total: self.set_status(message),
+            )
+            db_path = Path(self.repo.store_db_path(store))
+        else:
+            self.summary_rows = loaded_rows
+            db_path = Path(loaded_db_path) if loaded_db_path else Path(self.repo.store_db_path(store))
         headers = self.current_summary_columns()
         frozen_headers = self.current_frozen_columns(headers)
         scroll_headers = [header for header in headers if header not in frozen_headers]
@@ -1868,7 +1962,6 @@ class MainWindow(QMainWindow):
         if not current_sizes or sum(current_sizes) == 0:
             self.summary_splitter.setSizes([min(fixed_width, 520), 1000])
         type_text = report_type or "全部"
-        db_path = Path(self.repo.store_db_path(store))
         self.set_status(
             f"当前店铺：{store}    报表类型：{type_text}    数据库：{db_path.name}    汇总 {len(self.summary_rows)} 条",
             f"店铺数据库：{db_path}",

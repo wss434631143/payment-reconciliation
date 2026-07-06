@@ -396,6 +396,20 @@ class Repository:
         self.init_db()
         self._ensure_master_columns()
 
+    def close(self):
+        """关闭主库和店铺库连接，后台查询线程结束时主动释放资源。"""
+
+        for conn in list(self.store_conns.values()):
+            try:
+                conn.close()
+            except Exception:
+                pass
+        self.store_conns.clear()
+        try:
+            self.master_conn.close()
+        except Exception:
+            pass
+
     def init_db(self):
         """初始化主库、店铺目录和默认字段配置表。"""
 
