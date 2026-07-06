@@ -875,7 +875,7 @@ class StoreDialog(QDialog):
 class FieldListEditor(QWidget):
     """参数配置中的字段列表编辑器，支持增删、排序和冻结/活动区互移。"""
 
-    def __init__(self, values, title):
+    def __init__(self, values, title, batch_size=1000):
         super().__init__()
         self.table = FieldTableWidget(0, 1)
         self.table.setHorizontalHeaderLabels([title])
@@ -2306,8 +2306,13 @@ class MainWindow(QMainWindow):
         if not store:
             QMessageBox.warning(self, "未选择店铺", "请先选择店铺。")
             return
-        dialog = StoreConfigDialog(self, self.repo, store)
-        result = dialog.exec()
+        try:
+            dialog = StoreConfigDialog(self, self.repo, store)
+            result = dialog.exec()
+        except Exception:
+            QMessageBox.critical(self, "参数配置打开失败", traceback.format_exc())
+            self.set_status("参数配置打开失败，请查看错误信息。")
+            return
         if result == QDialog.Accepted or dialog.saved:
             self.clear_loaded_data("参数配置已保存。点击“查询”重新加载当前店铺数据。")
 
