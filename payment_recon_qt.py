@@ -552,8 +552,27 @@ class Repository:
     def app_settings(self):
         return [dict(row) for row in self.master_conn.execute("SELECT key, value, updated_at FROM app_settings ORDER BY key").fetchall()]
 
+
+    def _chunk_size_for_page_size(self, page_size):
+        """把分页行数换算成文件读写块大小，避免备份/还原一次性吞大文件。"""
+        try:
+            page_size = int(page_size or 1000)
+        except (TypeError, ValueError):
+            page_size = 1000
+        return max(256 * 1024, min(16 * 1024 * 1024, page_size * 4096))
+
+    def _chunk_count(self, size, chunk_size):
+        return max(1, (int(size or 0) + chunk_size - 1) // chunk_size)
+
+    def _store_page_size_from_configs(self, store_name, store_configs):
+        config = (store_configs or {}).get(store_name) or {}
+        try:
+            return max(100, int(config.get("page_size") or 1000))
+        except (TypeError, ValueError):
+            return 1000
+
     def backup_data(self, backup_path, store_names=None, include_settings=True, include_databases=True, include_configs=True, progress_callback=None):
-        """按用户选择备份店铺数据库、店铺配置和全局设置。"""
+        """按用户选择备份店铺数据库、店铺配置和全局设置，数据库文件按分页配置分块写入。"""
 
         store_names = [str(name).strip() for name in (store_names or []) if str(name).strip()]
         if not include_databases and not include_configs and not include_settings:
@@ -565,8 +584,8 @@ class Repository:
             rows = self.master_conn.execute("SELECT * FROM stores ORDER BY name").fetchall()
         stores = [dict(row) for row in rows]
         store_configs = {}
-        total_steps = max(1, len(stores) + 2)
         done_steps = 0
+        total_steps = max(1, len(stores) + 2)
         if progress_callback:
             progress_callback("正在准备备份清单...", done_steps, total_steps)
         if include_configs:
@@ -582,12 +601,32 @@ class Repository:
             else:
                 self.conn = self.master_conn
                 self.current_store = ""
-        done_steps += 1
+        backup_items = []
+        if include_databases:
+            previous_store = self.current_store
+            for store in stores:
+                name = store.get("name", "").strip()
+                db_file = store.get("db_file") or self._default_store_db_file(store.get("name", ""))
+                db_path = self.store_dir / db_file
+                config = store_configs.get(name)
+                if config is None and name:
+                    config = self.store_config(name)
+                page_size = self._store_page_size_from_configs(name, {name: config or {}})
+                chunk_size = self._chunk_size_for_page_size(page_size)
+                size = db_path.stat().st_size if db_path.exists() else 0
+                backup_items.append((store, db_file, db_path, size, chunk_size, self._chunk_count(size, chunk_size)))
+            if previous_store:
+                self.use_store(previous_store)
+            else:
+                self.conn = self.master_conn
+                self.current_store = ""
+        total_steps = max(1, 2 + (len(stores) if include_configs else 0) + sum(item[5] for item in backup_items))
+        done_steps = len(stores) if include_configs else 0
         if progress_callback:
             progress_callback("正在写入备份清单...", done_steps, total_steps)
         manifest = {
             "app": "payment_reconciliation_qt",
-            "version": "1.0.3",
+            "version": "1.0.4",
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "include_settings": bool(include_settings),
             "include_databases": bool(include_databases),
@@ -610,17 +649,29 @@ class Repository:
             if progress_callback:
                 progress_callback("备份清单已写入，正在处理店铺数据库...", done_steps, total_steps)
             if include_databases:
-                for store in stores:
+                for store, db_file, db_path, size, chunk_size, chunk_count in backup_items:
                     name = store.get("name", "").strip()
-                    db_file = store.get("db_file") or self._default_store_db_file(store.get("name", ""))
-                    db_path = self.store_dir / db_file
+                    label = name or db_file
                     if progress_callback:
-                        progress_callback(f"正在备份店铺：{name or db_file}", done_steps, total_steps)
+                        progress_callback(f"正在备份店铺：{label}", done_steps, total_steps)
                     if db_path.exists():
-                        zf.write(db_path, f"stores/{db_file}")
-                    done_steps += 1
+                        copied = 0
+                        with open(db_path, "rb") as src, zf.open(f"stores/{db_file}", "w") as dst:
+                            while True:
+                                chunk = src.read(chunk_size)
+                                if not chunk:
+                                    break
+                                dst.write(chunk)
+                                copied += len(chunk)
+                                done_steps += 1
+                                if progress_callback:
+                                    mb_done = copied / 1024 / 1024
+                                    mb_total = max(0, size) / 1024 / 1024
+                                    progress_callback(f"正在备份店铺：{label} {mb_done:.1f}/{mb_total:.1f} MB", done_steps, total_steps)
+                    else:
+                        done_steps += chunk_count
                     if progress_callback:
-                        progress_callback(f"已备份店铺：{name or db_file}", done_steps, total_steps)
+                        progress_callback(f"已备份店铺：{label}", done_steps, total_steps)
             else:
                 done_steps = total_steps
                 if progress_callback:
@@ -654,7 +705,7 @@ class Repository:
         self.initialized_store_dbs.discard(key)
 
     def restore_data(self, backup_path, store_names=None, restore_settings=True, restore_databases=True, restore_configs=True, progress_callback=None):
-        """按用户选择从 ZIP 还原店铺数据库、店铺配置和全局设置。"""
+        """按用户选择从 ZIP 还原店铺数据库、配置和设置，数据库文件按分页配置分块落盘。"""
 
         manifest = self.inspect_backup(backup_path)
         if not restore_databases and not restore_configs and not restore_settings:
@@ -674,6 +725,18 @@ class Repository:
             progress_callback("正在读取备份文件...", done_steps, total_steps)
         with zipfile.ZipFile(backup_path, "r") as zf:
             names = set(zf.namelist())
+            restore_items = {}
+            if restore_databases:
+                for store in stores:
+                    name = store.get("name", "").strip()
+                    db_file = store.get("db_file") or self._default_store_db_file(name)
+                    member = f"stores/{db_file}"
+                    if member in names:
+                        size = zf.getinfo(member).file_size
+                        page_size = self._store_page_size_from_configs(name, store_configs)
+                        chunk_size = self._chunk_size_for_page_size(page_size)
+                        restore_items[name] = (member, db_file, size, chunk_size, self._chunk_count(size, chunk_size))
+            total_steps = max(1, 2 + (len(stores) if restore_configs else 0) + sum(item[4] for item in restore_items.values()) + (1 if restore_settings else 0))
             done_steps += 1
             if progress_callback:
                 progress_callback("备份文件已读取，正在还原店铺...", done_steps, total_steps)
@@ -684,14 +747,25 @@ class Repository:
                 if progress_callback:
                     progress_callback(f"正在还原店铺：{name}", done_steps, total_steps)
                 db_file = store.get("db_file") or self._default_store_db_file(name)
-                member = f"stores/{db_file}"
                 if restore_databases:
                     self._close_store_connection_for_file(db_file)
-                if restore_databases and member in names:
+                if restore_databases and name in restore_items:
+                    member, db_file, size, chunk_size, chunk_count = restore_items[name]
                     target = self.store_dir / db_file
                     target.parent.mkdir(parents=True, exist_ok=True)
+                    copied = 0
                     with zf.open(member, "r") as src, open(target, "wb") as dst:
-                        dst.write(src.read())
+                        while True:
+                            chunk = src.read(chunk_size)
+                            if not chunk:
+                                break
+                            dst.write(chunk)
+                            copied += len(chunk)
+                            done_steps += 1
+                            if progress_callback:
+                                mb_done = copied / 1024 / 1024
+                                mb_total = max(0, size) / 1024 / 1024
+                                progress_callback(f"正在还原店铺：{name} {mb_done:.1f}/{mb_total:.1f} MB", done_steps, total_steps)
                 if restore_configs:
                     self.master_conn.execute("""
                         INSERT INTO stores (name, note, active, created_at, db_file)
@@ -723,7 +797,8 @@ class Repository:
                         cfg.get("frozen_columns", DEFAULT_FROZEN_COLUMNS),
                         cfg.get("page_size", 1000),
                     )
-                done_steps += 1
+                if restore_configs:
+                    done_steps += 1
                 if progress_callback:
                     progress_callback(f"已还原店铺：{name}", done_steps, total_steps)
         if restore_settings:
@@ -739,6 +814,7 @@ class Repository:
                     setting.get("value"),
                     setting.get("updated_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ))
+            done_steps += 1
         done_steps = total_steps
         if progress_callback:
             progress_callback("正在保存还原结果...", done_steps, total_steps)
@@ -1447,7 +1523,7 @@ class Repository:
         self.conn.execute("DELETE FROM adjustments WHERE id=?", (adj_id,))
         self.conn.commit()
 
-    def monthly_summaries(self, store_filter="", month_filter="", aggregate=True, report_type_filter=""):
+    def monthly_summaries(self, store_filter="", month_filter="", aggregate=True, report_type_filter="", progress_callback=None):
         """按店铺、报表类型、年月区间生成汇总行和区间合计行。"""
 
         store_filter = str(store_filter or "").strip()
@@ -1456,7 +1532,12 @@ class Repository:
         self.use_store(store_filter)
         months = parse_month_filter(month_filter)
         tx_rows = self._monthly_base_rows(store_filter, months, report_type_filter)
-        month_rows = [self._build_month_summary(row) for row in tx_rows]
+        month_rows = []
+        total_rows = max(1, len(tx_rows))
+        for idx, row in enumerate(tx_rows, 1):
+            if progress_callback:
+                progress_callback(f"正在汇总月份：{row['month_label']} ({idx}/{total_rows})", idx - 1, total_rows)
+            month_rows.append(self._build_month_summary(row, progress_callback=progress_callback))
         month_rows.extend(self._balance_only_rows(store_filter, months, report_type_filter))
         month_rows = sorted(month_rows, key=lambda x: (x["store"], x["report_type"], x["month_sort"]))
         if not aggregate or len(months) <= 1:
@@ -1498,29 +1579,42 @@ class Repository:
             GROUP BY store, report_type, month_sort
         """, params).fetchall()
 
-    def _raw_money_totals(self, store, months, report_type):
-        """按年月汇总原始表格里的金额型字段，供自定义汇总字段和公式引用。"""
+    def _raw_money_totals(self, store, months, report_type, progress_callback=None):
+        """按年月分批汇总原始表格里的金额型字段，供自定义汇总字段和公式引用。"""
 
         months = [m for m in (months or []) if m]
         if not months:
             return {}
+        self.use_store(store)
         params = [store, report_type] + months
-        rows = self.conn.execute(f"""
-            SELECT raw_payload
-            FROM transactions
-            WHERE store=? AND report_type=? AND month_sort IN ({",".join("?" for _ in months)})
-        """, params).fetchall()
+        where = f"store=? AND report_type=? AND month_sort IN ({','.join('?' for _ in months)})"
+        total = self.conn.execute(f"SELECT COUNT(*) AS count FROM transactions WHERE {where}", params).fetchone()["count"] or 0
+        page_size = self.store_config(store).get("page_size", 1000)
         totals = {}
-        for row in rows:
-            try:
-                payload = json.loads(row["raw_payload"] or "{}")
-            except Exception:
-                payload = {}
-            for field, value in payload.items():
-                field = normalize_config_column(field)
-                if not field or field in SYNTHETIC_RAW_COLUMNS or not is_money_like(value):
-                    continue
-                totals[field] = totals.get(field, Decimal("0.00")) + money(value)
+        processed = 0
+        while processed < total:
+            rows = self.conn.execute(f"""
+                SELECT raw_payload
+                FROM transactions
+                WHERE {where}
+                ORDER BY id
+                LIMIT ? OFFSET ?
+            """, params + [page_size, processed]).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                try:
+                    payload = json.loads(row["raw_payload"] or "{}")
+                except Exception:
+                    payload = {}
+                for field, value in payload.items():
+                    field = normalize_config_column(field)
+                    if not field or field in SYNTHETIC_RAW_COLUMNS or not is_money_like(value):
+                        continue
+                    totals[field] = totals.get(field, Decimal("0.00")) + money(value)
+            processed += len(rows)
+            if progress_callback:
+                progress_callback(f"正在加载自定义字段：{processed}/{total} 条", processed, max(1, total))
         return totals
 
     def _zero_amount_fallback_row(self, payload):
@@ -1533,30 +1627,43 @@ class Repository:
                 return False
         return True
 
-    def _scene_amount_totals(self, store, months, report_type):
-        """金额字段全空时，按动账场景汇总动账金额，供指定汇总字段兜底取数。"""
+    def _scene_amount_totals(self, store, months, report_type, progress_callback=None):
+        """金额字段全空时，按动账场景分批汇总动账金额，供指定汇总字段兜底取数。"""
 
         months = [m for m in (months or []) if m]
         if not months:
             return {}
+        self.use_store(store)
         params = [store, report_type] + months
-        rows = self.conn.execute(f"""
-            SELECT summary, amount, raw_payload
-            FROM transactions
-            WHERE store=? AND report_type=? AND month_sort IN ({",".join("?" for _ in months)})
-        """, params).fetchall()
+        where = f"store=? AND report_type=? AND month_sort IN ({','.join('?' for _ in months)})"
+        total = self.conn.execute(f"SELECT COUNT(*) AS count FROM transactions WHERE {where}", params).fetchone()["count"] or 0
+        page_size = self.store_config(store).get("page_size", 1000)
         totals = {}
-        for row in rows:
-            try:
-                payload = json.loads(row["raw_payload"] or "{}")
-            except Exception:
-                payload = {}
-            if not self._zero_amount_fallback_row(payload):
-                continue
-            scene = clean_cell_text(row["summary"]).strip()
-            if not scene:
-                continue
-            totals[scene] = totals.get(scene, Decimal("0.00")) + money(row["amount"])
+        processed = 0
+        while processed < total:
+            rows = self.conn.execute(f"""
+                SELECT summary, amount, raw_payload
+                FROM transactions
+                WHERE {where}
+                ORDER BY id
+                LIMIT ? OFFSET ?
+            """, params + [page_size, processed]).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                try:
+                    payload = json.loads(row["raw_payload"] or "{}")
+                except Exception:
+                    payload = {}
+                if not self._zero_amount_fallback_row(payload):
+                    continue
+                scene = clean_cell_text(row["summary"]).strip()
+                if not scene:
+                    continue
+                totals[scene] = totals.get(scene, Decimal("0.00")) + money(row["amount"])
+            processed += len(rows)
+            if progress_callback:
+                progress_callback(f"正在加载动账场景：{processed}/{total} 条", processed, max(1, total))
         return totals
 
     def _formula_values(self, summary, include_scene=False):
@@ -1572,7 +1679,7 @@ class Repository:
                 values[label] = money(value)
         return values
 
-    def _build_month_summary(self, row):
+    def _build_month_summary(self, row, progress_callback=None):
         """把数据库聚合结果、余额和调整记录组装成单月汇总。"""
 
         report_type = row["report_type"] or "已结算"
@@ -1606,8 +1713,8 @@ class Repository:
             "adjustment_notes": self.adjustment_notes(row["store"], [row["month_sort"]], report_type),
             "ending_balance": ending, "account_ending": account_ending, "difference": diff,
         }
-        summary["custom_values"] = self._raw_money_totals(row["store"], [row["month_sort"]], report_type)
-        summary["scene_values"] = self._scene_amount_totals(row["store"], [row["month_sort"]], report_type)
+        summary["custom_values"] = self._raw_money_totals(row["store"], [row["month_sort"]], report_type, progress_callback=progress_callback)
+        summary["scene_values"] = self._scene_amount_totals(row["store"], [row["month_sort"]], report_type, progress_callback=progress_callback)
         self.apply_store_formulas(row["store"], summary)
         summary["difference"] = None if summary["account_ending"] is None else summary["ending_balance"] - summary["account_ending"]
         return summary

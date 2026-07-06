@@ -856,8 +856,12 @@ class FieldListEditor(QWidget):
         self.table.setDragDropMode(QTableWidget.InternalMove)
         self.table.setDragDropOverwriteMode(False)
         self.table.setDefaultDropAction(Qt.MoveAction)
-        for value in values:
+        self.table.setUpdatesEnabled(False)
+        for index, value in enumerate(values or [], 1):
             self.add_value(value)
+            if index % max(100, int(batch_size or 1000)) == 0:
+                QApplication.processEvents()
+        self.table.setUpdatesEnabled(True)
 
         add_btn = QPushButton("新增字段")
         del_btn = QPushButton("删除字段")
@@ -952,17 +956,21 @@ class FieldListEditor(QWidget):
 class FormulaEditor(QWidget):
     """参数配置中的计算口径编辑器。"""
 
-    def __init__(self, formula_note):
+    def __init__(self, formula_note, batch_size=1000):
         super().__init__()
         self.table = CopyableTableWidget(0, 2)
         self.table.setHorizontalHeaderLabels(["汇总字段", "计算公式"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.SelectedClicked | QAbstractItemView.DoubleClicked | QAbstractItemView.EditKeyPressed)
-        for line in str(formula_note or "").splitlines():
+        self.table.setUpdatesEnabled(False)
+        for index, line in enumerate(str(formula_note or "").splitlines(), 1):
             if "=" in line:
                 target, expr = line.split("=", 1)
                 self.add_row(target.strip(), expr.strip())
+            if index % max(100, int(batch_size or 1000)) == 0:
+                QApplication.processEvents()
+        self.table.setUpdatesEnabled(True)
 
         add_btn = QPushButton("新增口径")
         del_btn = QPushButton("删除口径")
@@ -1017,10 +1025,11 @@ class StoreConfigDialog(QDialog):
             if not frozen_columns:
                 frozen_columns = summary_columns[:2] if len(summary_columns) >= 2 else ["店铺", "年月"]
         active_columns = [col for col in summary_columns if col not in frozen_columns]
-        self.raw_edit = FieldListEditor(config["raw_columns"], "原始表格字段")
-        self.frozen_summary_edit = FieldListEditor(frozen_columns, "冻结栏字段")
-        self.active_summary_edit = FieldListEditor(active_columns, "活动栏字段")
-        self.formula_edit = FormulaEditor(config["formula_note"])
+        batch_size = max(100, int(config.get("page_size", 1000)))
+        self.raw_edit = FieldListEditor(config["raw_columns"], "原始表格字段", batch_size=batch_size)
+        self.frozen_summary_edit = FieldListEditor(frozen_columns, "冻结栏字段", batch_size=batch_size)
+        self.active_summary_edit = FieldListEditor(active_columns, "活动栏字段", batch_size=batch_size)
+        self.formula_edit = FormulaEditor(config["formula_note"], batch_size=batch_size)
         self.page_size_spin = QSpinBox()
         self.page_size_spin.setRange(100, 100000)
         self.page_size_spin.setSingleStep(100)
@@ -1047,7 +1056,7 @@ class StoreConfigDialog(QDialog):
         page_widget = QWidget()
         page_layout = QFormLayout(page_widget)
         page_layout.addRow("明细每页行数 / 导出分批行数", self.page_size_spin)
-        page_hint = QLabel("默认 1000。数值越大，每页显示和每批导出越多，但大数据时界面可能更慢。")
+        page_hint = QLabel("默认 1000。该数值同时用于明细分页、导出分批、备份还原分块和大数据查询进度刷新。")
         page_hint.setObjectName("mutedLabel")
         page_layout.addRow("", page_hint)
         tabs.addTab(page_widget, "分页配置")
@@ -1813,7 +1822,12 @@ class MainWindow(QMainWindow):
         store = self.current_store()
         report_type = self.current_report_type_filter()
         self.detail_filter_value_cache.clear()
-        self.summary_rows = self.repo.monthly_summaries(store, self.month_filter.text().strip(), report_type_filter=report_type)
+        self.summary_rows = self.repo.monthly_summaries(
+            store,
+            self.month_filter.text().strip(),
+            report_type_filter=report_type,
+            progress_callback=lambda message, value, total: self.set_status(message),
+        )
         headers = self.current_summary_columns()
         frozen_headers = self.current_frozen_columns(headers)
         scroll_headers = [header for header in headers if header not in frozen_headers]
@@ -1823,7 +1837,12 @@ class MainWindow(QMainWindow):
         self.summary_scroll.setHorizontalHeaderLabels([display_header(header) for header in scroll_headers])
         self.summary_fixed.setRowCount(len(self.summary_rows))
         self.summary_scroll.setRowCount(len(self.summary_rows))
+        self.summary_fixed.setUpdatesEnabled(False)
+        self.summary_scroll.setUpdatesEnabled(False)
         for row_idx, row in enumerate(self.summary_rows):
+            if row_idx and row_idx % max(1, self.current_page_size()) == 0:
+                self.set_status(f"正在填充汇总表：{row_idx}/{len(self.summary_rows)} 条")
+                QApplication.processEvents()
             fixed_values = [self.summary_value(row, header) for header in frozen_headers]
             scroll_values = [self.summary_value(row, header) for header in scroll_headers]
             has_diff = row["difference"] is not None and row["difference"] != Decimal("0.00")
@@ -1840,6 +1859,8 @@ class MainWindow(QMainWindow):
                     item.setBackground(bg)
                     item.setForeground(QColor("#111827"))
                 self.summary_scroll.setItem(row_idx, col, item)
+        self.summary_fixed.setUpdatesEnabled(True)
+        self.summary_scroll.setUpdatesEnabled(True)
         self.auto_fit(self.summary_fixed, max_width=180)
         self.auto_fit(self.summary_scroll, max_width=260)
         fixed_width = sum(self.summary_fixed.columnWidth(col) for col in range(self.summary_fixed.columnCount())) + 24
@@ -2000,6 +2021,9 @@ class MainWindow(QMainWindow):
         )
         self.detail_table.setRowCount(len(rows))
         for r, tx in enumerate(rows):
+            if r and r % 500 == 0:
+                self.set_status(f"正在填充明细流水：{r}/{len(rows)} 条")
+                QApplication.processEvents()
             try:
                 payload = json.loads(tx["raw_payload"] or "{}")
             except Exception:
