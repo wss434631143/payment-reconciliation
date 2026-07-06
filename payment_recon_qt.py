@@ -1821,24 +1821,34 @@ class Repository:
         return result
 
     def apply_store_formulas(self, store, summary):
-        """应用店铺自定义计算口径，没有配置时使用默认公式。"""
+        """应用店铺自定义计算口径，多轮计算以支持公式之间相互引用。"""
 
         formulas = parse_formula_lines(self.store_config(store)["formula_note"])
+        if not formulas:
+            return
         values = self._formula_values(summary)
-        for target, expr in formulas:
-            try:
-                formula_values = self._formula_values(summary, include_scene=target in SCENE_FALLBACK_TARGETS)
-                formula_values.update(values)
-                if target in SCENE_FALLBACK_TARGETS:
-                    formula_values.update(summary.get("scene_values", {}))
-                result = eval_money_formula(expr, formula_values)
-            except Exception:
-                continue
-            if target in FIELD_KEYS:
-                summary[FIELD_KEYS[target]] = result
-            else:
-                summary.setdefault("custom_values", {})[target] = result
-            values[target] = result
+        max_rounds = max(2, len(formulas) + 1)
+        for _round in range(max_rounds):
+            changed = False
+            for target, expr in formulas:
+                try:
+                    formula_values = self._formula_values(summary, include_scene=target in SCENE_FALLBACK_TARGETS)
+                    formula_values.update(values)
+                    if target in SCENE_FALLBACK_TARGETS:
+                        formula_values.update(summary.get("scene_values", {}))
+                    result = eval_money_formula(expr, formula_values)
+                except Exception:
+                    continue
+                old_value = values.get(target)
+                if target in FIELD_KEYS:
+                    summary[FIELD_KEYS[target]] = result
+                else:
+                    summary.setdefault("custom_values", {})[target] = result
+                values[target] = result
+                if old_value is None or money(old_value) != money(result):
+                    changed = True
+            if not changed:
+                break
 
     def balance_for(self, store, month_sort, report_type="已结算"):
         self.use_store(store)
